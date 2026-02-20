@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hook-to-Short - YouTube to Short Video</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <h1>🎵 Hook-to-Short</h1>
+                <p>Extract catchy hooks from YouTube music</p>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Tab Navigation -->
+            <nav class="tabs">
+                <button class="tab-btn active" onclick="switchTab('download')">📥 Download Music</button>
+                <button class="tab-btn" onclick="switchTab('library')">📚 My Library</button>
+                <button class="tab-btn" onclick="switchTab('create')">🎬 Create Short</button>
+            </nav>
+
+            <!-- Download Tab -->
+            <section id="download" class="tab-content active">
+                <div class="card">
+                    <h2>Download from YouTube</h2>
+                    <div class="input-group">
+                        <input 
+                            type="url" 
+                            id="youtubeUrl" 
+                            placeholder="Paste YouTube link here... https://www.youtube.com/watch?v=..."
+                            class="input-field"
+                        >
+                        <button class="btn btn-primary" onclick="downloadAudio()">
+                            <span>⬇️ Download & Convert</span>
+                        </button>
+                    </div>
+
+                    <!-- Download Status -->
+                    <div id="downloadStatus" class="hidden">
+                        <div class="spinner"></div>
+                        <p id="statusMessage">Downloading... Please wait</p>
+                    </div>
+
+                    <!-- Download Result -->
+                    <div id="downloadResult" class="hidden">
+                        <div id="resultContent"></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>📖 How It Works</h3>
+                    <ol>
+                        <li>Paste a YouTube music link</li>
+                        <li>Click "Download & Convert"</li>
+                        <li>Audio will be converted to MP3 (128kbps)</li>
+                        <li>Song info will be saved to your library</li>
+                    </ol>
+                </div>
+            </section>
+
+            <!-- Library Tab -->
+            <section id="library" class="tab-content">
+                <div class="card">
+                    <h2>📚 My Downloaded Tracks</h2>
+                    <button class="btn btn-secondary" onclick="loadTracks()">Refresh</button>
+                </div>
+
+                <div id="tracksList" class="tracks-grid">
+                    <!-- Will be populated by JavaScript -->
+                </div>
+            </section>
+
+            <!-- Create Short Tab -->
+            <section id="create" class="tab-content">
+                <div class="card">
+                    <h2>🎬 Create Short Video</h2>
+                    <p>Select a track from your library and create a short video</p>
+                    
+                    <div class="form-group">
+                        <label>Select Track:</label>
+                        <select id="trackSelect" class="input-field">
+                            <option value="">-- Choose a track --</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Hook Length (seconds):</label>
+                        <input type="number" id="hookLength" class="input-field" value="30" min="10" max="60">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Platform:</label>
+                        <select id="platform" class="input-field">
+                            <option value="tiktok">TikTok (1080×1920)</option>
+                            <option value="reels">Instagram Reels (1080×1920)</option>
+                            <option value="youtube">YouTube (1920×1080)</option>
+                            <option value="youtube-short">YouTube Shorts (1080×1920)</option>
+                        </select>
+                    </div>
+
+                    <button class="btn btn-primary" onclick="extractHook()">
+                        🎵 Extract Hook
+                    </button>
+
+                    <div id="hookStatus" class="hidden">
+                        <div class="spinner"></div>
+                        <p>Extracting hook... (This may take a minute)</p>
+                    </div>
+
+                    <div id="hookResult" class="hidden"></div>
+                </div>
+
+                <div class="card">
+                    <h3>📝 Requirements</h3>
+                    <ul>
+                        <li>Background video file (MP4, AVI, etc.)</li>
+                        <li>FFmpeg installed on your system</li>
+                        <li>Recommended: pychorus for better chorus detection</li>
+                    </ul>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Hook-to-Short • Extract music hooks & create viral short videos</p>
+        </footer>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>

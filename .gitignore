@@ -1,0 +1,35 @@
+# Environment & secrets
+.env
+
+# Python
+.venv/
+.venv-1/
+__pycache__/
+*.pyc
+*.py[cod]
+
+# Media files (audio/video)
+*.mp3
+*.mp4
+*.wav
+*.avi
+*.mkv
+*.mov
+*.flac
+*.ogg
+*.m4a
+
+# Images & screenshots
+*.PNG
+*.png
+*.jpg
+*.jpeg
+
+# Output & data
+outputs/
+downloads/
+tracks.json
+
+# OS
+Thumbs.db
+.DS_Store
