@@ -30,6 +30,11 @@ outputs/
 downloads/
 tracks.json
 
+# PyInstaller
+build/
+dist/
+*.spec
+
 # OS
 Thumbs.db
 .DS_Store

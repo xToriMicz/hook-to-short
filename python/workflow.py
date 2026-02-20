@@ -279,7 +279,7 @@ if __name__ == '__main__':
     orchestrator = FulWorkflowOrchestrator(
         downloads_folder='./downloads',
         outputs_folder='./outputs',
-        kie_api_key='f4db5bd53d5b128d3b84f841c981851b'  # Kie.ai API key
+        kie_api_key=None
     )
     
     # Test with a URL (replace with real link)
