@@ -38,6 +38,8 @@ if os.path.exists(_env_path):
 
 import customtkinter as ctk
 import tkinter.font as tkfont
+import tkinter.filedialog as tkfiledialog
+import tkinter.messagebox as tkmessagebox
 from PIL import Image as PILImage
 
 # Monkey-patch: soundfile 0.13+ removed SoundFileRuntimeError but librosa still expects it
@@ -54,7 +56,7 @@ from python.gemini_generator import GeminiImageGenerator
 from python.video_composer import VideoComposer, compose_complete_short
 from python.uploaders import UploadRequest, UploadResult, UploadStatus, get_output_videos, upload_with_retry
 from python.uploaders.youtube_uploader import YouTubeUploader
-from python.uploaders.tiktok_uploader import TikTokUploader
+from python.uploaders.tiktok_browser import TikTokBrowserUploader
 from python.uploaders.facebook_uploader import FacebookUploader
 
 # ---------------------------------------------------------------------------
@@ -1195,16 +1197,36 @@ class HookToShortApp(ctk.CTk):
                 text="เสร็จสมบูรณ์! (อัปโหลดอัตโนมัติ: ไม่มีแพลตฟอร์มที่เลือก)")
             return
 
+        # Filter out unconfigured platforms for auto-upload (skip silently)
+        s = load_settings()
+        ready = []
+        for p in platforms:
+            if p == "youtube" and os.path.exists("client_secrets.json"):
+                ready.append(p)
+            elif p == "tiktok" and TikTokBrowserUploader().is_configured():
+                ready.append(p)
+            elif p == "facebook" and s.get("facebook_access_token"):
+                ready.append(p)
+        skipped = len(platforms) - len(ready)
+        platforms = ready
+
+        if not platforms:
+            self.gen_progress.configure(
+                text="เสร็จสมบูรณ์! (อัปโหลดอัตโนมัติ: ไม่มีแพลตฟอร์มที่ตั้งค่าแล้ว)")
+            return
+
         tags_raw = self.upload_tags_var.get().strip()
         tags = [t.strip().replace("#", "") for t in tags_raw.split(",") if t.strip()]
         privacy = self.upload_privacy_var.get()
+        promo_link = self.upload_promo_link_var.get().strip()
+        auto_desc = promo_link if promo_link else ""
         fname = os.path.basename(video_path)
 
         self.gen_progress.configure(text="เสร็จสมบูรณ์! กำลังอัปโหลดอัตโนมัติ...")
         self.status_var.set("อัปโหลดอัตโนมัติ...")
 
         def task():
-            results = self._upload_single(video_path, title, "", tags, privacy, platforms,
+            results = self._upload_single(video_path, title, auto_desc, tags, privacy, platforms,
                                           step_prefix="[auto] ")
             add_upload_record(fname, results)
             success = sum(1 for r in results if r.status == UploadStatus.SUCCESS)
@@ -1294,6 +1316,14 @@ class HookToShortApp(ctk.CTk):
         self.upload_tags_var = ctk.StringVar(value="Shorts, เพลง, เพลงไทย, HookToShort")
         ctk.CTkEntry(tags_frame, textvariable=self.upload_tags_var, font=self._font(13),
                      placeholder_text="คั่นด้วย comma").pack(side="left", fill="x", expand=True)
+
+        # Promo Link
+        link_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        link_frame.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(link_frame, text="Promo Link:", font=self._font(13), width=80, anchor="w").pack(side="left")
+        self.upload_promo_link_var = ctk.StringVar(value="")
+        ctk.CTkEntry(link_frame, textvariable=self.upload_promo_link_var, font=self._font(13),
+                     placeholder_text="เช่น Spotify, YouTube, เว็บไซต์").pack(side="left", fill="x", expand=True)
 
         # Privacy
         priv_frame = ctk.CTkFrame(tab, fg_color="transparent")
@@ -1477,22 +1507,22 @@ class HookToShortApp(ctk.CTk):
             self.yt_status_label.configure(text="ยังไม่ตั้งค่า", text_color="#e67e22")
             self.yt_manual_btn.pack(side="left", padx=(4, 0))
 
-        # TikTok
+        # TikTok (Browser — cookie check)
         s = load_settings()
-        tt_key = s.get("tiktok_client_key", "")
-        tt_secret = s.get("tiktok_client_secret", "")
-        if tt_key and tt_secret:
-            self.tt_status_label.configure(text="พร้อม", text_color="#2ecc71")
+        tt_browser = TikTokBrowserUploader()
+        if tt_browser.is_configured():
+            self.tt_status_label.configure(text="พร้อม (cookie)", text_color="#2ecc71")
             self.tt_manual_btn.pack_forget()
         else:
-            self.tt_status_label.configure(text="ยังไม่ตั้งค่า", text_color="#e67e22")
+            self.tt_status_label.configure(text="ยังไม่ได้ login", text_color="#e67e22")
             self.tt_manual_btn.pack(side="left", padx=(4, 0))
 
         # Facebook
-        fb_id = s.get("facebook_page_id", "")
         fb_token = s.get("facebook_access_token", "")
-        if fb_id and fb_token:
-            self.fb_status_label.configure(text="พร้อม", text_color="#2ecc71")
+        if fb_token:
+            fb_id = s.get("facebook_page_id", "")
+            target = f"Page: {fb_id}" if fb_id else "โปรไฟล์ส่วนตัว"
+            self.fb_status_label.configure(text=f"พร้อม ({target})", text_color="#2ecc71")
             self.fb_manual_btn.pack_forget()
         else:
             self.fb_status_label.configure(text="ยังไม่ตั้งค่า", text_color="#e67e22")
@@ -1550,11 +1580,7 @@ class HookToShortApp(ctk.CTk):
                 results.append(result)
             elif platform == "tiktok":
                 self._upload_step(f"{step} TikTok: กำลังอัปโหลด...")
-                s = load_settings()
-                tt = TikTokUploader(
-                    client_key=s.get("tiktok_client_key", ""),
-                    client_secret=s.get("tiktok_client_secret", ""),
-                )
+                tt = TikTokBrowserUploader()
                 result = upload_with_retry(
                     lambda: tt.upload(request, progress_callback=self._upload_progress_callback))
                 results.append(result)
@@ -1596,9 +1622,31 @@ class HookToShortApp(ctk.CTk):
             self.upload_progress.configure(text="กรุณาเลือกอย่างน้อย 1 แพลตฟอร์ม")
             return
 
+        # Pre-upload credential validation
+        missing = []
+        s = load_settings()
+        if "youtube" in platforms:
+            if not os.path.exists("client_secrets.json"):
+                missing.append("YouTube: ไม่พบ client_secrets.json — ไปที่ Setup Wizard หรือตั้งค่า")
+        if "tiktok" in platforms:
+            if not TikTokBrowserUploader().is_configured():
+                missing.append("TikTok: ยังไม่ได้ login — ไปที่ตั้งค่า > Login TikTok")
+        if "facebook" in platforms:
+            if not s.get("facebook_access_token"):
+                missing.append("Facebook: ยังไม่ได้ตั้งค่า Access Token")
+
+        if missing:
+            msg = "ตั้งค่า credentials ไม่ครบ:\n\n" + "\n".join(f"  - {m}" for m in missing)
+            msg += "\n\nไปที่แท็บ 'ตั้งค่า' หรือกด Setup Wizard"
+            tkmessagebox.showwarning("ยังไม่พร้อมอัปโหลด", msg)
+            return
+
         # Shared metadata
         custom_title = self.upload_title_var.get().strip()
         description = self.upload_desc_textbox.get("1.0", "end").strip()
+        promo_link = self.upload_promo_link_var.get().strip()
+        if promo_link:
+            description = f"{description}\n{promo_link}" if description else promo_link
         tags_raw = self.upload_tags_var.get().strip()
         tags = [t.strip().replace("#", "") for t in tags_raw.split(",") if t.strip()]
         privacy = self.upload_privacy_var.get()
@@ -1693,13 +1741,28 @@ class HookToShortApp(ctk.CTk):
     def _build_settings_tab(self):
         tab = self.tab_settings
 
-        # Section header
-        ctk.CTkLabel(tab, text="API Keys", font=self._font(16, "bold")).pack(
+        # Scrollable container for settings
+        settings_scroll = ctk.CTkScrollableFrame(tab)
+        settings_scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
+        # --- Setup Wizard button ---
+        wizard_frame = ctk.CTkFrame(settings_scroll, fg_color="transparent")
+        wizard_frame.pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkButton(
+            wizard_frame, text="Setup Wizard", width=160,
+            font=self._font(14, "bold"), fg_color="#8e44ad",
+            hover_color="#6c3483", command=self._open_setup_wizard,
+        ).pack(side="left")
+        ctk.CTkLabel(wizard_frame, text="คู่มือตั้งค่า API ทีละขั้นตอน",
+                      font=self._font(12), text_color="gray").pack(side="left", padx=(10, 0))
+
+        # Section header — API Keys
+        ctk.CTkLabel(settings_scroll, text="API Keys", font=self._font(16, "bold")).pack(
             anchor="w", padx=12, pady=(12, 8)
         )
 
         # --- KIE_API_KEY ---
-        kie_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        kie_frame = ctk.CTkFrame(settings_scroll, fg_color="transparent")
         kie_frame.pack(fill="x", padx=12, pady=(0, 6))
 
         ctk.CTkLabel(kie_frame, text="Kie.ai API Key:", font=self._font(13), width=140, anchor="w").pack(side="left")
@@ -1716,7 +1779,7 @@ class HookToShortApp(ctk.CTk):
         self._kie_toggle_btn.pack(side="left")
 
         # --- GEMINI_API_KEY ---
-        gemini_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        gemini_frame = ctk.CTkFrame(settings_scroll, fg_color="transparent")
         gemini_frame.pack(fill="x", padx=12, pady=(0, 6))
 
         ctk.CTkLabel(gemini_frame, text="Gemini API Key:", font=self._font(13), width=140, anchor="w").pack(side="left")
@@ -1733,50 +1796,110 @@ class HookToShortApp(ctk.CTk):
         self._gemini_toggle_btn.pack(side="left")
 
         # --- Upload API Settings ---
-        ctk.CTkLabel(tab, text="Upload API", font=self._font(16, "bold")).pack(
+        ctk.CTkLabel(settings_scroll, text="Upload API", font=self._font(16, "bold")).pack(
             anchor="w", padx=12, pady=(16, 8)
         )
 
-        # YouTube — just shows status (needs client_secrets.json file)
-        yt_info = ctk.CTkFrame(tab, fg_color="transparent")
-        yt_info.pack(fill="x", padx=12, pady=(0, 4))
-        ctk.CTkLabel(yt_info, text="YouTube:", font=self._font(13), width=140, anchor="w").pack(side="left")
-        yt_configured = os.path.exists("client_secrets.json")
-        yt_text = "พร้อม (client_secrets.json)" if yt_configured else "วาง client_secrets.json ใน project folder"
-        yt_color = "#2ecc71" if yt_configured else "#e67e22"
-        ctk.CTkLabel(yt_info, text=yt_text, font=self._font(12), text_color=yt_color).pack(side="left")
+        # ---- YouTube ----
+        yt_box = ctk.CTkFrame(settings_scroll)
+        yt_box.pack(fill="x", padx=12, pady=(0, 8))
 
-        # TikTok Client Key
-        tt_key_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        tt_key_frame.pack(fill="x", padx=12, pady=(0, 3))
-        ctk.CTkLabel(tt_key_frame, text="TikTok Client Key:", font=self._font(13), width=140, anchor="w").pack(side="left")
+        yt_header = ctk.CTkFrame(yt_box, fg_color="transparent")
+        yt_header.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkLabel(yt_header, text="YouTube", font=self._font(14, "bold")).pack(side="left")
+        self._yt_settings_status = ctk.CTkLabel(yt_header, text="", font=self._font(11))
+        self._yt_settings_status.pack(side="right")
+
+        yt_row = ctk.CTkFrame(yt_box, fg_color="transparent")
+        yt_row.pack(fill="x", padx=8, pady=(0, 6))
+
+        self._yt_file_label = ctk.CTkLabel(yt_row, text="", font=self._font(12), anchor="w")
+        self._yt_file_label.pack(side="left")
+        self._update_yt_file_status()
+
+        ctk.CTkButton(yt_row, text="เลือกไฟล์...", width=90, font=self._font(12),
+                       command=self._browse_youtube_secrets).pack(side="left", padx=(8, 4))
+        ctk.CTkButton(yt_row, text="Google Console", width=110, font=self._font(12),
+                       fg_color="transparent", text_color="#3498db",
+                       hover_color=("gray85", "gray30"),
+                       command=lambda: webbrowser.open(
+                           "https://console.cloud.google.com/apis/credentials")
+                       ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(yt_row, text="ทดสอบ", width=70, font=self._font(12),
+                       fg_color="#27ae60", hover_color="#1e8449",
+                       command=self._test_youtube).pack(side="right")
+
+        # ---- TikTok (Browser Automation) ----
+        tt_box = ctk.CTkFrame(settings_scroll)
+        tt_box.pack(fill="x", padx=12, pady=(0, 8))
+
+        tt_header = ctk.CTkFrame(tt_box, fg_color="transparent")
+        tt_header.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkLabel(tt_header, text="TikTok", font=self._font(14, "bold")).pack(side="left")
+        ctk.CTkLabel(tt_header, text="(Browser — login ครั้งเดียว)",
+                      font=self._font(11), text_color="#3498db").pack(side="left", padx=(6, 0))
+        self._tt_settings_status = ctk.CTkLabel(tt_header, text="", font=self._font(11))
+        self._tt_settings_status.pack(side="right")
+
+        tt_desc_row = ctk.CTkFrame(tt_box, fg_color="transparent")
+        tt_desc_row.pack(fill="x", padx=8, pady=(2, 4))
+        ctk.CTkLabel(tt_desc_row,
+                      text="Login TikTok ผ่านเบราว์เซอร์ครั้งเดียว แล้วอัปโหลดอัตโนมัติได้เลย",
+                      font=self._font(12), text_color="gray", wraplength=500,
+                      justify="left").pack(anchor="w")
+
+        tt_btn_frame = ctk.CTkFrame(tt_box, fg_color="transparent")
+        tt_btn_frame.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkButton(tt_btn_frame, text="Login TikTok", width=160,
+                       font=self._font(13, "bold"), fg_color="#e1306c", hover_color="#c2185b",
+                       command=self._tiktok_browser_login).pack(side="left")
+        ctk.CTkButton(tt_btn_frame, text="ล้าง Cookie", width=100, font=self._font(12),
+                       fg_color="transparent", text_color="#e74c3c",
+                       hover_color=("gray85", "gray30"),
+                       command=self._tiktok_clear_cookies).pack(side="left", padx=(8, 0))
+
+        self._tt_cookie_status = ctk.CTkLabel(tt_box, text="", font=self._font(12))
+        self._tt_cookie_status.pack(anchor="w", padx=8, pady=(0, 6))
+        self._update_tiktok_cookie_status()
+
+        # ---- Facebook ----
         saved = load_settings()
-        self._tt_key_var = ctk.StringVar(value=saved.get("tiktok_client_key", ""))
-        ctk.CTkEntry(tt_key_frame, textvariable=self._tt_key_var, width=380, font=self._font(13), show="*").pack(side="left")
+        fb_box = ctk.CTkFrame(settings_scroll)
+        fb_box.pack(fill="x", padx=12, pady=(0, 8))
 
-        # TikTok Client Secret
-        tt_sec_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        tt_sec_frame.pack(fill="x", padx=12, pady=(0, 6))
-        ctk.CTkLabel(tt_sec_frame, text="TikTok Secret:", font=self._font(13), width=140, anchor="w").pack(side="left")
-        self._tt_secret_var = ctk.StringVar(value=saved.get("tiktok_client_secret", ""))
-        ctk.CTkEntry(tt_sec_frame, textvariable=self._tt_secret_var, width=380, font=self._font(13), show="*").pack(side="left")
+        fb_header = ctk.CTkFrame(fb_box, fg_color="transparent")
+        fb_header.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkLabel(fb_header, text="Facebook Reels", font=self._font(14, "bold")).pack(side="left")
+        self._fb_settings_status = ctk.CTkLabel(fb_header, text="", font=self._font(11))
+        self._fb_settings_status.pack(side="right")
 
-        # Facebook Page ID
-        fb_id_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        fb_id_frame.pack(fill="x", padx=12, pady=(0, 3))
-        ctk.CTkLabel(fb_id_frame, text="Facebook Page ID:", font=self._font(13), width=140, anchor="w").pack(side="left")
-        self._fb_page_id_var = ctk.StringVar(value=saved.get("facebook_page_id", ""))
-        ctk.CTkEntry(fb_id_frame, textvariable=self._fb_page_id_var, width=380, font=self._font(13)).pack(side="left")
-
-        # Facebook Access Token
-        fb_tok_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        fb_tok_frame.pack(fill="x", padx=12, pady=(0, 6))
-        ctk.CTkLabel(fb_tok_frame, text="Facebook Token:", font=self._font(13), width=140, anchor="w").pack(side="left")
+        fb_tok_frame = ctk.CTkFrame(fb_box, fg_color="transparent")
+        fb_tok_frame.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkLabel(fb_tok_frame, text="Access Token:", font=self._font(13), width=120, anchor="w").pack(side="left")
         self._fb_token_var = ctk.StringVar(value=saved.get("facebook_access_token", ""))
-        ctk.CTkEntry(fb_tok_frame, textvariable=self._fb_token_var, width=380, font=self._font(13), show="*").pack(side="left")
+        ctk.CTkEntry(fb_tok_frame, textvariable=self._fb_token_var, width=350, font=self._font(13), show="*").pack(side="left")
+
+        fb_id_frame = ctk.CTkFrame(fb_box, fg_color="transparent")
+        fb_id_frame.pack(fill="x", padx=8, pady=(0, 3))
+        ctk.CTkLabel(fb_id_frame, text="Page ID:", font=self._font(13), width=120, anchor="w").pack(side="left")
+        self._fb_page_id_var = ctk.StringVar(value=saved.get("facebook_page_id", ""))
+        ctk.CTkEntry(fb_id_frame, textvariable=self._fb_page_id_var, width=350, font=self._font(13),
+                      placeholder_text="ไม่ใส่ = โปรไฟล์ส่วนตัว").pack(side="left")
+
+        fb_btn_frame = ctk.CTkFrame(fb_box, fg_color="transparent")
+        fb_btn_frame.pack(fill="x", padx=8, pady=(0, 6))
+        ctk.CTkButton(fb_btn_frame, text="Graph API Explorer", width=140, font=self._font(12),
+                       fg_color="transparent", text_color="#3498db",
+                       hover_color=("gray85", "gray30"),
+                       command=lambda: webbrowser.open(
+                           "https://developers.facebook.com/tools/explorer/")
+                       ).pack(side="left")
+        ctk.CTkButton(fb_btn_frame, text="ทดสอบ", width=70, font=self._font(12),
+                       fg_color="#27ae60", hover_color="#1e8449",
+                       command=self._test_facebook).pack(side="right")
 
         # --- Save button + status ---
-        save_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        save_frame = ctk.CTkFrame(settings_scroll, fg_color="transparent")
         save_frame.pack(fill="x", padx=12, pady=(8, 4))
 
         ctk.CTkButton(
@@ -1797,6 +1920,478 @@ class HookToShortApp(ctk.CTk):
         self._gemini_key_entry.configure(show="" if self._gemini_show else "*")
         self._gemini_toggle_btn.configure(text="ซ่อน" if self._gemini_show else "แสดง")
 
+    # --- YouTube file browse ---
+
+    def _update_yt_file_status(self):
+        """Update YouTube client_secrets.json status label."""
+        if os.path.exists("client_secrets.json"):
+            try:
+                with open("client_secrets.json", "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # Validate structure
+                if "installed" in data or "web" in data:
+                    self._yt_file_label.configure(
+                        text="client_secrets.json (OK)",
+                        text_color="#2ecc71")
+                else:
+                    self._yt_file_label.configure(
+                        text="client_secrets.json (รูปแบบไม่ถูกต้อง)",
+                        text_color="#e74c3c")
+            except (json.JSONDecodeError, OSError):
+                self._yt_file_label.configure(
+                    text="client_secrets.json (อ่านไม่ได้)",
+                    text_color="#e74c3c")
+        else:
+            self._yt_file_label.configure(
+                text="ยังไม่มี client_secrets.json",
+                text_color="#e67e22")
+
+    def _browse_youtube_secrets(self):
+        """Open file dialog to select client_secrets.json and copy it to project folder."""
+        import shutil
+        filepath = tkfiledialog.askopenfilename(
+            title="เลือก client_secrets.json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not filepath:
+            return
+
+        # Validate the file
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "installed" not in data and "web" not in data:
+                tkmessagebox.showerror(
+                    "รูปแบบไม่ถูกต้อง",
+                    "ไฟล์นี้ไม่ใช่ OAuth 2.0 Client Secret\n\n"
+                    "ต้องมี key 'installed' หรือ 'web'\n"
+                    "ดาวน์โหลดจาก Google Cloud Console > Credentials > OAuth 2.0 Client IDs")
+                return
+        except (json.JSONDecodeError, OSError) as e:
+            tkmessagebox.showerror("อ่านไฟล์ไม่ได้", str(e))
+            return
+
+        # Copy to project folder
+        dest = os.path.join(_base_dir, "client_secrets.json")
+        try:
+            shutil.copy2(filepath, dest)
+            self._update_yt_file_status()
+            self._update_platform_status()
+            self._yt_settings_status.configure(text="คัดลอกไฟล์แล้ว", text_color="#2ecc71")
+        except OSError as e:
+            tkmessagebox.showerror("คัดลอกไม่ได้", str(e))
+
+    # --- Test Connection buttons ---
+
+    def _test_youtube(self):
+        """Test YouTube OAuth2 connection."""
+        self._yt_settings_status.configure(text="กำลังทดสอบ...", text_color="#f39c12")
+        self.update_idletasks()
+
+        if not os.path.exists("client_secrets.json"):
+            self._yt_settings_status.configure(
+                text="ไม่พบ client_secrets.json", text_color="#e74c3c")
+            return
+
+        # Validate file format
+        try:
+            with open("client_secrets.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "installed" not in data and "web" not in data:
+                self._yt_settings_status.configure(
+                    text="รูปแบบไฟล์ไม่ถูกต้อง", text_color="#e74c3c")
+                return
+        except (json.JSONDecodeError, OSError):
+            self._yt_settings_status.configure(
+                text="อ่านไฟล์ไม่ได้", text_color="#e74c3c")
+            return
+
+        def task():
+            yt = YouTubeUploader()
+            ok = yt.authenticate()
+            def done():
+                if ok:
+                    self._yt_settings_status.configure(
+                        text="เชื่อมต่อ YouTube สำเร็จ!", text_color="#2ecc71")
+                else:
+                    self._yt_settings_status.configure(
+                        text="เชื่อมต่อไม่สำเร็จ", text_color="#e74c3c")
+                self._update_platform_status()
+            self.after(0, done)
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _tiktok_browser_login(self):
+        """Open browser for TikTok login, save cookies."""
+        self._tt_settings_status.configure(text="กำลังเปิดเบราว์เซอร์...", text_color="#f39c12")
+        self._tt_cookie_status.configure(text="กรุณา login ในเบราว์เซอร์ที่เปิดขึ้นมา...", text_color="#f39c12")
+        self.update_idletasks()
+
+        def task():
+            tt = TikTokBrowserUploader()
+            ok = tt.login()
+            def done():
+                if ok:
+                    self._tt_settings_status.configure(
+                        text="Login TikTok สำเร็จ!", text_color="#2ecc71")
+                else:
+                    self._tt_settings_status.configure(
+                        text="Login ไม่สำเร็จ — ลองใหม่", text_color="#e74c3c")
+                self._update_tiktok_cookie_status()
+                self._update_platform_status()
+            self.after(0, done)
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _tiktok_clear_cookies(self):
+        """Delete TikTok cookies for re-login."""
+        tt = TikTokBrowserUploader()
+        tt.clear_cookies()
+        self._tt_settings_status.configure(text="ลบ cookie แล้ว", text_color="#f39c12")
+        self._update_tiktok_cookie_status()
+        self._update_platform_status()
+
+    def _update_tiktok_cookie_status(self):
+        """Update the TikTok cookie status label."""
+        tt = TikTokBrowserUploader()
+        if tt.is_configured():
+            self._tt_cookie_status.configure(
+                text="พร้อม (cookie saved)", text_color="#2ecc71")
+        else:
+            self._tt_cookie_status.configure(
+                text="ยังไม่ได้ login", text_color="#e67e22")
+
+    def _test_facebook(self):
+        """Test Facebook access token."""
+        page_id = self._fb_page_id_var.get().strip()
+        token = self._fb_token_var.get().strip()
+
+        if not token:
+            self._fb_settings_status.configure(
+                text="กรุณากรอก Access Token ก่อน", text_color="#e74c3c")
+            return
+
+        # Save credentials first
+        s = load_settings()
+        s["facebook_page_id"] = page_id
+        s["facebook_access_token"] = token
+        save_settings(s)
+
+        self._fb_settings_status.configure(text="กำลังทดสอบ...", text_color="#f39c12")
+        self.update_idletasks()
+
+        def task():
+            fb = FacebookUploader(page_id=page_id, access_token=token)
+            ok = fb.is_authenticated()
+            def done():
+                if ok:
+                    self._fb_settings_status.configure(
+                        text="เชื่อมต่อ Facebook สำเร็จ!", text_color="#2ecc71")
+                else:
+                    self._fb_settings_status.configure(
+                        text="Token ไม่ถูกต้อง/หมดอายุ", text_color="#e74c3c")
+                self._update_platform_status()
+            self.after(0, done)
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # --- Setup Wizard ---
+
+    def _open_setup_wizard(self):
+        """Open a step-by-step wizard dialog for setting up upload credentials."""
+        wizard = ctk.CTkToplevel(self)
+        wizard.title("Setup Wizard — ตั้งค่าอัปโหลด")
+        wizard.geometry("620x520")
+        wizard.resizable(False, False)
+        wizard.transient(self)
+        wizard.grab_set()
+
+        # Center on parent
+        wizard.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - 620) // 2
+        y = self.winfo_y() + (self.winfo_height() - 520) // 2
+        wizard.geometry(f"+{x}+{y}")
+
+        # State
+        wizard._step = 0
+        steps = ["YouTube", "TikTok", "Facebook", "เสร็จสิ้น"]
+
+        # Header with step indicator
+        header_frame = ctk.CTkFrame(wizard, fg_color="transparent")
+        header_frame.pack(fill="x", padx=16, pady=(12, 6))
+
+        step_labels = []
+        for i, name in enumerate(steps):
+            lbl = ctk.CTkLabel(header_frame, text=f"{i+1}. {name}",
+                               font=self._font(13), text_color="gray")
+            lbl.pack(side="left", padx=(0, 16))
+            step_labels.append(lbl)
+
+        # Content area
+        content = ctk.CTkFrame(wizard)
+        content.pack(fill="both", expand=True, padx=16, pady=8)
+
+        # Navigation
+        nav = ctk.CTkFrame(wizard, fg_color="transparent")
+        nav.pack(fill="x", padx=16, pady=(4, 12))
+
+        skip_btn = ctk.CTkButton(nav, text="ข้าม", width=80, font=self._font(13),
+                                  fg_color="transparent", text_color="gray",
+                                  hover_color=("gray85", "gray30"))
+        skip_btn.pack(side="left")
+
+        done_btn = ctk.CTkButton(nav, text="ถัดไป", width=100, font=self._font(14, "bold"))
+        done_btn.pack(side="right")
+
+        back_btn = ctk.CTkButton(nav, text="ก่อนหน้า", width=80, font=self._font(13),
+                                  fg_color="transparent", text_color="#3498db",
+                                  hover_color=("gray85", "gray30"))
+        back_btn.pack(side="right", padx=(0, 8))
+
+        def show_step(step_idx):
+            wizard._step = step_idx
+            # Update step indicator
+            for i, lbl in enumerate(step_labels):
+                if i == step_idx:
+                    lbl.configure(text_color="#3498db", font=self._font(13, "bold"))
+                elif i < step_idx:
+                    lbl.configure(text_color="#2ecc71", font=self._font(13))
+                else:
+                    lbl.configure(text_color="gray", font=self._font(13))
+
+            # Clear content
+            for w in content.winfo_children():
+                w.destroy()
+
+            # Navigation state
+            back_btn.configure(state="normal" if step_idx > 0 else "disabled")
+            if step_idx < len(steps) - 1:
+                done_btn.configure(text="ถัดไป")
+                skip_btn.pack(side="left")
+            else:
+                done_btn.configure(text="ปิด")
+                skip_btn.pack_forget()
+
+            if step_idx == 0:
+                self._wizard_youtube(content)
+            elif step_idx == 1:
+                self._wizard_tiktok(content)
+            elif step_idx == 2:
+                self._wizard_facebook(content)
+            elif step_idx == 3:
+                self._wizard_done(content)
+
+        def next_step():
+            if wizard._step >= len(steps) - 1:
+                wizard.destroy()
+                self._update_platform_status()
+                return
+            show_step(wizard._step + 1)
+
+        def prev_step():
+            if wizard._step > 0:
+                show_step(wizard._step - 1)
+
+        skip_btn.configure(command=next_step)
+        done_btn.configure(command=next_step)
+        back_btn.configure(command=prev_step)
+
+        show_step(0)
+
+    def _wizard_youtube(self, parent):
+        """YouTube setup step content."""
+        ctk.CTkLabel(parent, text="YouTube Shorts", font=self._font(18, "bold")).pack(
+            anchor="w", padx=12, pady=(10, 4))
+
+        instructions = (
+            "1. ไปที่ Google Cloud Console\n"
+            "2. สร้าง Project ใหม่ (หรือเลือก Project ที่มี)\n"
+            "3. เปิด YouTube Data API v3\n"
+            "4. ไปที่ Credentials > Create Credentials > OAuth Client ID\n"
+            "5. เลือก Application Type: Desktop App\n"
+            "6. ดาวน์โหลดไฟล์ JSON แล้วเลือกด้านล่าง"
+        )
+        ctk.CTkLabel(parent, text=instructions, font=self._font(12),
+                      justify="left", wraplength=560).pack(
+            anchor="w", padx=12, pady=(0, 8))
+
+        # Link to console
+        ctk.CTkButton(parent, text="เปิด Google Cloud Console",
+                       font=self._font(13), width=220,
+                       command=lambda: webbrowser.open(
+                           "https://console.cloud.google.com/apis/credentials")
+                       ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        # File status + browse
+        file_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        file_frame.pack(fill="x", padx=12, pady=4)
+
+        status_text = "client_secrets.json"
+        if os.path.exists("client_secrets.json"):
+            status_color = "#2ecc71"
+            status_text += " (พบแล้ว)"
+        else:
+            status_color = "#e67e22"
+            status_text += " (ยังไม่มี)"
+        wiz_yt_lbl = ctk.CTkLabel(file_frame, text=status_text,
+                                    font=self._font(13), text_color=status_color)
+        wiz_yt_lbl.pack(side="left")
+
+        def browse_and_update():
+            self._browse_youtube_secrets()
+            if os.path.exists("client_secrets.json"):
+                wiz_yt_lbl.configure(text="client_secrets.json (พบแล้ว)",
+                                      text_color="#2ecc71")
+
+        ctk.CTkButton(file_frame, text="เลือกไฟล์...", width=100, font=self._font(12),
+                       command=browse_and_update).pack(side="left", padx=(10, 0))
+
+    def _wizard_tiktok(self, parent):
+        """TikTok setup step content — browser login."""
+        ctk.CTkLabel(parent, text="TikTok", font=self._font(18, "bold")).pack(
+            anchor="w", padx=12, pady=(10, 4))
+
+        # Description
+        ctk.CTkLabel(parent,
+                      text="Login TikTok ผ่านเบราว์เซอร์ครั้งเดียว\n"
+                           "ระบบจะจำ cookie ไว้ แล้วอัปโหลดอัตโนมัติได้เลย",
+                      font=self._font(13), justify="left", wraplength=540).pack(
+            anchor="w", padx=12, pady=(0, 10))
+
+        # Cookie status
+        tt = TikTokBrowserUploader()
+        wiz_tt_status = ctk.CTkLabel(parent, text="", font=self._font(12))
+        wiz_tt_status.pack(anchor="w", padx=12, pady=(0, 6))
+        if tt.is_configured():
+            wiz_tt_status.configure(text="พร้อม (cookie saved)", text_color="#2ecc71")
+        else:
+            wiz_tt_status.configure(text="ยังไม่ได้ login", text_color="#e67e22")
+
+        # Login button
+        def on_wizard_login():
+            wiz_tt_status.configure(text="กำลังเปิดเบราว์เซอร์...", text_color="#f39c12")
+            parent.update_idletasks()
+            def task():
+                browser_tt = TikTokBrowserUploader()
+                ok = browser_tt.login()
+                def done():
+                    if ok:
+                        wiz_tt_status.configure(text="Login สำเร็จ! (cookie saved)", text_color="#2ecc71")
+                    else:
+                        wiz_tt_status.configure(text="Login ไม่สำเร็จ — ลองใหม่", text_color="#e74c3c")
+                    self._update_platform_status()
+                    try:
+                        self._update_tiktok_cookie_status()
+                    except Exception:
+                        pass
+                self.after(0, done)
+            threading.Thread(target=task, daemon=True).start()
+
+        ctk.CTkButton(parent, text="Login TikTok", width=200,
+                       font=self._font(14, "bold"), fg_color="#e1306c", hover_color="#c2185b",
+                       command=on_wizard_login).pack(anchor="w", padx=12, pady=(0, 10))
+
+        # Instructions
+        instructions = (
+            "วิธีใช้:\n"
+            "1. กด 'Login TikTok' — เบราว์เซอร์ Edge จะเปิดขึ้น\n"
+            "2. Login ด้วยบัญชี TikTok ของคุณ\n"
+            "3. เมื่อ login สำเร็จ เบราว์เซอร์จะปิดอัตโนมัติ\n"
+            "4. Cookie จะถูกบันทึกไว้ใช้อัปโหลดครั้งต่อไป"
+        )
+        ctk.CTkLabel(parent, text=instructions, font=self._font(11),
+                      justify="left", wraplength=560, text_color="gray").pack(
+            anchor="w", padx=12, pady=(0, 6))
+
+    def _wizard_facebook(self, parent):
+        """Facebook setup step content."""
+        ctk.CTkLabel(parent, text="Facebook Reels", font=self._font(18, "bold")).pack(
+            anchor="w", padx=12, pady=(10, 4))
+
+        instructions = (
+            "1. ไปที่ developers.facebook.com > สร้าง App\n"
+            "2. เพิ่ม Facebook Login product\n"
+            "3. ไปที่ Graph API Explorer\n"
+            "4. เลือก permission: publish_video\n"
+            "   (เพิ่ม pages_manage_posts ถ้าจะโพสต์ลง Page)\n"
+            "5. สร้าง Access Token แล้วแปลงเป็น Long-Lived Token\n"
+            "6. คัดลอก Access Token มาวางด้านล่าง"
+        )
+        ctk.CTkLabel(parent, text=instructions, font=self._font(12),
+                      justify="left", wraplength=560).pack(
+            anchor="w", padx=12, pady=(0, 8))
+
+        ctk.CTkButton(parent, text="เปิด Graph API Explorer",
+                       font=self._font(13), width=220,
+                       command=lambda: webbrowser.open(
+                           "https://developers.facebook.com/tools/explorer/")
+                       ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        # Input fields — Token first (required), Page ID optional
+
+        tok_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        tok_frame.pack(fill="x", padx=12, pady=3)
+        ctk.CTkLabel(tok_frame, text="Access Token:", font=self._font(13),
+                      width=110, anchor="w").pack(side="left")
+        ctk.CTkEntry(tok_frame, textvariable=self._fb_token_var,
+                      width=380, font=self._font(13), show="*").pack(side="left")
+
+        id_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        id_frame.pack(fill="x", padx=12, pady=3)
+        ctk.CTkLabel(id_frame, text="Page ID:", font=self._font(13),
+                      width=110, anchor="w").pack(side="left")
+        ctk.CTkEntry(id_frame, textvariable=self._fb_page_id_var,
+                      width=280, font=self._font(13),
+                      placeholder_text="ไม่ใส่ = โปรไฟล์ส่วนตัว").pack(side="left")
+        ctk.CTkLabel(id_frame, text="(optional)", font=self._font(11),
+                      text_color="gray").pack(side="left", padx=(6, 0))
+
+    def _wizard_done(self, parent):
+        """Summary step — show what's configured."""
+        ctk.CTkLabel(parent, text="ตั้งค่าเสร็จสิ้น!", font=self._font(18, "bold")).pack(
+            anchor="w", padx=12, pady=(10, 8))
+
+        # Check each platform
+        checks = []
+
+        yt = YouTubeUploader()
+        if yt.is_configured():
+            checks.append(("YouTube", True, "client_secrets.json พร้อม"))
+        else:
+            checks.append(("YouTube", False, "ยังไม่มี client_secrets.json"))
+
+        tt_browser = TikTokBrowserUploader()
+        if tt_browser.is_configured():
+            checks.append(("TikTok", True, "Cookie พร้อม — login แล้ว"))
+        else:
+            checks.append(("TikTok", False, "ยังไม่ได้ login"))
+
+        fb_tok = self._fb_token_var.get().strip()
+        fb_id = self._fb_page_id_var.get().strip()
+        if fb_tok:
+            target = f"Page: {fb_id}" if fb_id else "โปรไฟล์ส่วนตัว"
+            checks.append(("Facebook", True, f"Token พร้อม ({target})"))
+        else:
+            checks.append(("Facebook", False, "ยังไม่ได้ตั้งค่า Access Token"))
+
+        for name, ok, desc in checks:
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=3)
+            icon = "[OK]" if ok else "[--]"
+            color = "#2ecc71" if ok else "#e67e22"
+            ctk.CTkLabel(row, text=f"{icon} {name}", font=self._font(14, "bold"),
+                          text_color=color, width=140, anchor="w").pack(side="left")
+            ctk.CTkLabel(row, text=desc, font=self._font(12),
+                          text_color="gray").pack(side="left")
+
+        configured = sum(1 for _, ok, _ in checks if ok)
+        ctk.CTkLabel(parent,
+                      text=f"\nตั้งค่าแล้ว {configured}/3 แพลตฟอร์ม\n"
+                           f"กด 'บันทึก' ในหน้าตั้งค่าเพื่อบันทึก credentials\n"
+                           f"แล้วกด 'ทดสอบ' เพื่อตรวจสอบการเชื่อมต่อ",
+                      font=self._font(13), justify="left", wraplength=560).pack(
+            anchor="w", padx=12, pady=(12, 0))
+
     def _on_save_settings(self):
         # Save API keys to .env
         keys = {
@@ -1813,8 +2408,6 @@ class HookToShortApp(ctk.CTk):
 
         # Save upload credentials to settings.json
         s = load_settings()
-        s["tiktok_client_key"] = self._tt_key_var.get().strip()
-        s["tiktok_client_secret"] = self._tt_secret_var.get().strip()
         s["facebook_page_id"] = self._fb_page_id_var.get().strip()
         s["facebook_access_token"] = self._fb_token_var.get().strip()
         save_settings(s)

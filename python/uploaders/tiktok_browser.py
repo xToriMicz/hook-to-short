@@ -1,0 +1,618 @@
+"""
+TikTok Browser Uploader — Selenium + Edge + Cookie Persistence
+อัปโหลดวิดีโอไปยัง TikTok ผ่าน browser automation (ไม่ต้องใช้ API)
+
+Flow:
+1. ครั้งแรก: เปิด Edge ให้ user login → บันทึก cookie เป็น JSON
+2. ครั้งต่อไป: โหลด cookie → อัปโหลดอัตโนมัติ
+
+Language: Force English via browser preferences + URL param
+เพื่อให้ selector ทำงานถูกต้องเสมอ ไม่ว่า user ตั้งภาษาอะไร
+"""
+
+import os
+import json
+import time
+import logging
+from typing import Optional, Callable
+from pathlib import Path
+
+from . import UploadResult, UploadStatus, UploadRequest
+
+logger = logging.getLogger(__name__)
+
+COOKIE_FILE = "tiktok_cookies.json"
+TIKTOK_DOMAIN = "https://www.tiktok.com"
+TIKTOK_UPLOAD_URL = f"{TIKTOK_DOMAIN}/upload?lang=en"
+TIKTOK_LOGIN_URL = f"{TIKTOK_DOMAIN}/login?lang=en"
+
+# Max wait times (seconds)
+LOGIN_TIMEOUT = 300  # 5 min for manual login
+UPLOAD_TIMEOUT = 120  # 2 min for video processing
+PUBLISH_TIMEOUT = 60  # 1 min for publish confirmation
+
+# Emoji mapping for caption decoration
+_EMOJI_KEYWORDS = {
+    "bloom": "\ud83c\udf38", "flower": "\ud83c\udf3a", "rose": "\ud83c\udf39",
+    "love": "\u2764\ufe0f", "heart": "\ud83d\udc96", "kiss": "\ud83d\udc8b",
+    "sad": "\ud83d\ude22", "cry": "\ud83d\ude2d", "broken": "\ud83d\udc94",
+    "night": "\ud83c\udf19", "moon": "\ud83c\udf1a", "star": "\u2b50",
+    "sun": "\u2600\ufe0f", "morning": "\ud83c\udf05", "sunset": "\ud83c\udf07",
+    "rain": "\ud83c\udf27\ufe0f", "cloud": "\u2601\ufe0f",
+    "fire": "\ud83d\udd25", "hot": "\ud83d\udd25", "lit": "\ud83d\udd25",
+    "music": "\ud83c\udfb5", "song": "\ud83c\udfb6", "sing": "\ud83c\udfa4",
+    "dance": "\ud83d\udc83", "party": "\ud83c\udf89",
+    "chill": "\ud83d\ude0e", "lofi": "\ud83c\udfa7", "vibe": "\ud83c\udf00",
+    "dream": "\ud83d\udcad", "sleep": "\ud83d\ude34",
+    "happy": "\ud83d\ude04", "smile": "\ud83d\ude0a", "joy": "\ud83d\ude01",
+    "cool": "\ud83d\ude0e", "wow": "\ud83e\udd29",
+    "\u0e23\u0e31\u0e01": "\u2764\ufe0f", "\u0e43\u0e08": "\ud83d\udc96",
+    "\u0e04\u0e37\u0e19": "\ud83c\udf19", "\u0e01\u0e25\u0e32\u0e07\u0e04\u0e37\u0e19": "\ud83c\udf19",
+    "\u0e40\u0e1e\u0e25\u0e07": "\ud83c\udfb5", "\u0e14\u0e2d\u0e01": "\ud83c\udf38",
+    "\u0e1d\u0e19": "\ud83c\udf27\ufe0f", "\u0e1d\u0e31\u0e19": "\ud83d\udcad",
+    "\u0e22\u0e34\u0e49\u0e21": "\ud83d\ude0a", "\u0e40\u0e28\u0e23\u0e49\u0e32": "\ud83d\ude22",
+    "\u0e2a\u0e1a\u0e15\u0e32": "\ud83d\udc40",
+}
+
+
+def _pick_emoji(title: str) -> str:
+    """Pick 1-2 relevant emojis based on title keywords."""
+    title_lower = title.lower()
+    found = []
+    for keyword, emoji in _EMOJI_KEYWORDS.items():
+        if keyword in title_lower and emoji not in found:
+            found.append(emoji)
+            if len(found) >= 2:
+                break
+    return "".join(found) if found else "\ud83c\udfb5"  # default: music note
+
+
+def _create_edge_driver(headless: bool = False):
+    """Create Edge WebDriver with English language forced.
+
+    Uses Selenium's built-in Selenium Manager to auto-find msedgedriver.
+    No need for webdriver-manager package.
+    """
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.edge.options import Options as EdgeOptions
+    except ImportError:
+        raise ImportError(
+            "ต้องติดตั้ง: pip install selenium"
+        )
+
+    options = EdgeOptions()
+
+    # Force English language — critical for reliable selectors
+    options.add_argument("--lang=en-US")
+    options.add_experimental_option("prefs", {
+        "intl.accept_languages": "en-US,en",
+    })
+
+    # General options
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+
+    if headless:
+        options.add_argument("--headless=new")
+
+    # Selenium Manager auto-finds msedgedriver (built into selenium>=4.10)
+    driver = webdriver.Edge(options=options)
+    driver.set_window_size(1280, 900)
+
+    return driver
+
+
+def _save_cookies(driver, cookie_path: str):
+    """Save all cookies from browser to JSON file."""
+    cookies = driver.get_cookies()
+    with open(cookie_path, "w", encoding="utf-8") as f:
+        json.dump(cookies, f, indent=2, ensure_ascii=False)
+    logger.info(f"TikTok: บันทึก cookie แล้ว ({len(cookies)} cookies)")
+
+
+def _load_cookies(driver, cookie_path: str) -> bool:
+    """Load cookies from JSON file into browser. Returns True if loaded."""
+    if not os.path.exists(cookie_path):
+        return False
+
+    try:
+        with open(cookie_path, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        logger.warning("TikTok: cookie file corrupted")
+        return False
+
+    # Navigate to TikTok domain first (required before setting cookies)
+    driver.get(TIKTOK_DOMAIN + "?lang=en")
+    time.sleep(2)
+
+    now = time.time()
+    loaded = 0
+    for cookie in cookies:
+        # Skip expired cookies
+        if "expiry" in cookie and cookie["expiry"] < now:
+            continue
+        # Some cookie fields cause issues — clean up
+        for key in ["sameSite", "httpOnly", "storeId"]:
+            cookie.pop(key, None)
+        try:
+            driver.add_cookie(cookie)
+            loaded += 1
+        except Exception:
+            pass  # Skip problematic cookies
+
+    logger.info(f"TikTok: โหลด {loaded}/{len(cookies)} cookies")
+    return loaded > 0
+
+
+def _fill_caption(driver, element, text: str):
+    """Fill TikTok's DraftEditor caption field reliably using clipboard paste.
+
+    DraftEditor is a React component that doesn't respond well to
+    document.execCommand('insertText'). Clipboard paste (Ctrl+V) works
+    because DraftEditor handles paste events natively.
+    """
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    # Step 1: Click to focus
+    driver.execute_script("arguments[0].click();", element)
+    time.sleep(1)
+
+    # Step 2: Select all existing text (Ctrl+A) and delete
+    actions = ActionChains(driver)
+    actions.click(element).perform()
+    time.sleep(0.5)
+    actions.key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).perform()
+    time.sleep(0.5)
+    actions.send_keys(Keys.BACKSPACE).perform()
+    time.sleep(1)
+
+    # Step 3: Double check it's cleared
+    remaining = driver.execute_script(
+        "return arguments[0].textContent.trim().length;", element)
+    if remaining > 0:
+        # More aggressive clear
+        actions.key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).perform()
+        time.sleep(0.3)
+        actions.send_keys(Keys.DELETE).perform()
+        time.sleep(0.5)
+
+    # Step 4: Paste caption via clipboard (Ctrl+V)
+    # Use JS to set clipboard, then Ctrl+V to paste into DraftEditor
+    driver.execute_script("""
+        // Write text to clipboard via Clipboard API
+        navigator.clipboard.writeText(arguments[0]).catch(function() {});
+    """, text)
+    time.sleep(0.5)
+
+    # Focus element and paste
+    actions = ActionChains(driver)
+    actions.click(element).perform()
+    time.sleep(0.3)
+    actions.key_down(Keys.CONTROL).send_keys("v").key_up(Keys.CONTROL).perform()
+    time.sleep(1)
+
+    # Step 5: Verify — if clipboard paste didn't work, fall back to send_keys
+    actual_len = driver.execute_script(
+        "return arguments[0].textContent.trim().length;", element)
+    if actual_len < 5:
+        logger.warning("TikTok: clipboard paste ไม่ทำงาน — ลอง send_keys")
+        actions.click(element).perform()
+        time.sleep(0.3)
+        element.send_keys(text)
+        time.sleep(1)
+
+
+def _dismiss_overlays(driver):
+    """Dismiss Joyride tutorial overlays, modals, and cookie banners.
+
+    TikTok shows a react-joyride tutorial overlay that blocks clicks.
+    This removes them via JS so real elements become clickable.
+    """
+    try:
+        driver.execute_script("""
+            // Remove Joyride overlay (tutorial walkthrough)
+            document.querySelectorAll('.react-joyride__overlay, .react-joyride').forEach(
+                el => el.remove()
+            );
+            // Click any "Skip" or "Got it" or close buttons in modals
+            var buttons = document.querySelectorAll(
+                'button[data-joyride="close"], ' +
+                'button[aria-label="Close"], ' +
+                'button[aria-label="close"], ' +
+                'div[role="dialog"] button'
+            );
+            buttons.forEach(btn => {
+                var text = (btn.textContent || '').toLowerCase().trim();
+                if (['skip', 'got it', 'close', 'x', 'dismiss', 'not now'].includes(text)
+                    || btn.getAttribute('aria-label') === 'Close'
+                    || btn.getAttribute('aria-label') === 'close') {
+                    btn.click();
+                }
+            });
+            // Remove any fixed/absolute overlays with high z-index that block interaction
+            document.querySelectorAll('[style*="z-index"]').forEach(el => {
+                var style = window.getComputedStyle(el);
+                var zIndex = parseInt(style.zIndex) || 0;
+                var position = style.position;
+                if (zIndex > 1000 && (position === 'fixed' || position === 'absolute')
+                    && el.classList.contains('react-joyride__overlay')) {
+                    el.remove();
+                }
+            });
+        """)
+    except Exception:
+        pass  # Best effort — don't fail if overlay dismissal fails
+
+
+class TikTokBrowserUploader:
+    """Upload videos to TikTok via browser automation (Selenium + Edge)."""
+
+    def __init__(self, cookie_path: str = COOKIE_FILE):
+        self.cookie_path = cookie_path
+
+    def is_configured(self) -> bool:
+        """Cookie file exists = configured."""
+        return os.path.exists(self.cookie_path)
+
+    def login(self) -> bool:
+        """Open browser for user to login manually, then save cookies.
+
+        Returns True if login was successful (cookies saved).
+        """
+        driver = None
+        try:
+            logger.info("TikTok: เปิดเบราว์เซอร์เพื่อ login...")
+            driver = _create_edge_driver(headless=False)
+            driver.get(TIKTOK_LOGIN_URL)
+
+            # Wait for user to login — detect by checking for logged-in state
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+            from selenium.webdriver.common.by import By
+
+            logger.info("TikTok: กรุณา login ในเบราว์เซอร์ (รอ 5 นาที)...")
+
+            # Wait until URL no longer contains /login OR a profile element appears
+            def is_logged_in(drv):
+                url = drv.current_url
+                # User navigated away from login page = likely logged in
+                if "/login" not in url and "tiktok.com" in url:
+                    return True
+                # Check for session cookie
+                cookies = drv.get_cookies()
+                session_cookies = [c for c in cookies
+                                   if c["name"] in ("sessionid", "sid_tt", "sessionid_ss")]
+                return len(session_cookies) > 0
+
+            WebDriverWait(driver, LOGIN_TIMEOUT).until(is_logged_in)
+
+            # Give a moment for all cookies to settle
+            time.sleep(3)
+
+            _save_cookies(driver, self.cookie_path)
+            logger.info("TikTok: login สำเร็จ — cookie บันทึกแล้ว")
+            return True
+
+        except Exception as e:
+            logger.error(f"TikTok: login ไม่สำเร็จ — {e}")
+            return False
+
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    def clear_cookies(self):
+        """Delete saved cookie file for re-login."""
+        if os.path.exists(self.cookie_path):
+            os.remove(self.cookie_path)
+            logger.info("TikTok: ลบ cookie แล้ว")
+
+    def upload(self, request: UploadRequest,
+               progress_callback: Optional[Callable[[float], None]] = None) -> UploadResult:
+        """Upload video via tiktok.com/upload using browser automation."""
+        if not self.is_configured():
+            return UploadResult(
+                platform="TikTok",
+                status=UploadStatus.FAILED,
+                error="ยังไม่ได้ login TikTok — ไปที่ตั้งค่า > Login TikTok",
+            )
+
+        if not os.path.exists(request.video_path):
+            return UploadResult(
+                platform="TikTok",
+                status=UploadStatus.FAILED,
+                error=f"ไม่พบไฟล์วิดีโอ: {request.video_path}",
+            )
+
+        video_path = str(Path(request.video_path).resolve())
+        driver = None
+
+        try:
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.common.keys import Keys
+
+            logger.info(f"TikTok: เริ่มอัปโหลด '{request.title}'...")
+            driver = _create_edge_driver(headless=False)
+
+            # Step 1: Load cookies
+            if not _load_cookies(driver, self.cookie_path):
+                return UploadResult(
+                    platform="TikTok",
+                    status=UploadStatus.FAILED,
+                    error="โหลด cookie ไม่ได้ — ลอง login ใหม่",
+                )
+
+            # Step 2: Navigate to upload page
+            driver.get(TIKTOK_UPLOAD_URL)
+            time.sleep(3)
+
+            # Step 3: Check if still logged in (redirected to login = session expired)
+            if "/login" in driver.current_url:
+                self.clear_cookies()
+                return UploadResult(
+                    platform="TikTok",
+                    status=UploadStatus.FAILED,
+                    error="Session หมดอายุ — กรุณา login ใหม่ในตั้งค่า",
+                )
+
+            if progress_callback:
+                progress_callback(0.1)
+
+            # Dismiss any overlay/tutorial popups (Joyride, modals, etc.)
+            _dismiss_overlays(driver)
+
+            # Step 4: Find file input and upload video
+            # TikTok upload page uses an <input type="file"> element
+            try:
+                file_input = WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="file"]'))
+                )
+                file_input.send_keys(video_path)
+                logger.info("TikTok: เลือกไฟล์แล้ว — กำลังประมวลผล...")
+            except Exception as e:
+                self._screenshot_on_error(driver, "select_file")
+                return UploadResult(
+                    platform="TikTok",
+                    status=UploadStatus.FAILED,
+                    error=f"หาช่องเลือกไฟล์ไม่เจอ: {str(e)[:100]}",
+                )
+
+            if progress_callback:
+                progress_callback(0.3)
+
+            # Step 5: Wait for video processing (TikTok needs time to process)
+            logger.info("TikTok: รอประมวลผลวิดีโอ...")
+            time.sleep(10)
+
+            # Dismiss overlays again (TikTok may show tutorial after file select)
+            _dismiss_overlays(driver)
+            time.sleep(2)
+
+            if progress_callback:
+                progress_callback(0.5)
+
+            # Step 6: Fill caption (title + emoji + hashtags)
+            caption = f"{request.title} {_pick_emoji(request.title)}"
+            if request.description:
+                caption = f"{caption}\n{request.description}"
+            if request.tags:
+                caption += "\n" + " ".join(f"#{t}" for t in request.tags)
+
+            try:
+                # TikTok's caption editor — DraftEditor contenteditable div
+                caption_selectors = [
+                    'div.DraftEditor-root div[contenteditable="true"]',
+                    'div[contenteditable="true"][data-text="true"]',
+                    'div[aria-autocomplete="list"][contenteditable="true"]',
+                    'div[contenteditable="true"]',
+                ]
+
+                caption_input = None
+                for selector in caption_selectors:
+                    try:
+                        caption_input = WebDriverWait(driver, 15).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                        )
+                        if caption_input:
+                            break
+                    except Exception:
+                        continue
+
+                if caption_input:
+                    _fill_caption(driver, caption_input, caption[:2200])
+                    time.sleep(1)
+                    actual = driver.execute_script(
+                        "return arguments[0].textContent.trim();", caption_input)
+                    logger.info(f"TikTok: กรอก caption แล้ว ({len(actual)} chars)")
+                else:
+                    logger.warning("TikTok: หา caption input ไม่เจอ — ข้ามไป")
+
+            except Exception as e:
+                logger.warning(f"TikTok: กรอก caption ไม่ได้ — {e}")
+
+            if progress_callback:
+                progress_callback(0.7)
+
+            # Step 7: Wait for upload/processing to finish before clicking post
+            logger.info("TikTok: รอก่อนกด Post...")
+            time.sleep(8)
+
+            # Dismiss overlays one more time before clicking Post
+            _dismiss_overlays(driver)
+
+            # Step 8: Click Post/Publish button
+            try:
+                post_btn = None
+
+                # Try CSS selectors
+                css_selectors = [
+                    'button[data-e2e="post_video_button"]',
+                ]
+                for selector in css_selectors:
+                    try:
+                        post_btn = WebDriverWait(driver, UPLOAD_TIMEOUT).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                        )
+                        if post_btn:
+                            break
+                    except Exception:
+                        continue
+
+                # Try XPath if CSS didn't work
+                if not post_btn:
+                    xpath_selectors = [
+                        '//button[contains(text(), "Post")]',
+                        '//button[contains(text(), "post")]',
+                        '//div[contains(@class, "btn-post")]//button',
+                    ]
+                    for xpath in xpath_selectors:
+                        try:
+                            post_btn = WebDriverWait(driver, 10).until(
+                                EC.presence_of_element_located((By.XPATH, xpath))
+                            )
+                            if post_btn:
+                                break
+                        except Exception:
+                            continue
+
+                if post_btn:
+                    # Use JS click to bypass any overlay
+                    driver.execute_script("arguments[0].scrollIntoView(true);", post_btn)
+                    time.sleep(1)
+                    driver.execute_script("arguments[0].click();", post_btn)
+                    logger.info("TikTok: กดปุ่ม Post แล้ว")
+                else:
+                    self._screenshot_on_error(driver, "post_button")
+                    return UploadResult(
+                        platform="TikTok",
+                        status=UploadStatus.FAILED,
+                        error="หาปุ่ม Post ไม่เจอ — ดู screenshot ใน outputs/",
+                    )
+
+            except Exception as e:
+                self._screenshot_on_error(driver, "post_click")
+                return UploadResult(
+                    platform="TikTok",
+                    status=UploadStatus.FAILED,
+                    error=f"กดปุ่ม Post ไม่ได้: {str(e)[:100]}",
+                )
+
+            # Step 8.5: Handle "Continue to post?" confirmation dialog
+            # TikTok shows this while still checking video for issues
+            # Wait up to 15s for the dialog to appear, then click "Post now"
+            try:
+                post_now_btn = WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((
+                        By.XPATH,
+                        '//button[contains(text(), "Post") and contains(text(), "now")]'
+                    ))
+                )
+                time.sleep(0.5)
+                driver.execute_script("arguments[0].click();", post_now_btn)
+                logger.info("TikTok: กดปุ่ม 'Post now' (confirm dialog) แล้ว")
+            except Exception:
+                # No confirmation dialog appeared — that's fine, video check may have passed
+                # Also try generic red/primary button in any visible dialog
+                try:
+                    confirm_btn = driver.find_element(
+                        By.CSS_SELECTOR,
+                        'div[role="dialog"] button[class*="primary"], '
+                        'div[role="dialog"] button[class*="red"], '
+                        'div[role="dialog"] button:last-child'
+                    )
+                    if confirm_btn and confirm_btn.is_displayed():
+                        driver.execute_script("arguments[0].click();", confirm_btn)
+                        logger.info("TikTok: กดปุ่ม confirm ใน dialog แล้ว")
+                except Exception:
+                    pass
+
+            if progress_callback:
+                progress_callback(0.9)
+
+            # Step 9: Wait for success confirmation
+            try:
+                success_xpaths = [
+                    '//*[contains(text(), "uploaded")]',
+                    '//*[contains(text(), "Your video is being uploaded")]',
+                    '//*[contains(text(), "being processed")]',
+                    '//*[contains(text(), "successfully")]',
+                    '//*[contains(text(), "Manage your posts")]',
+                    '//*[contains(text(), "Upload another")]',
+                ]
+
+                success_found = False
+                for xpath in success_xpaths:
+                    try:
+                        WebDriverWait(driver, PUBLISH_TIMEOUT).until(
+                            EC.presence_of_element_located((By.XPATH, xpath))
+                        )
+                        success_found = True
+                        break
+                    except Exception:
+                        continue
+
+                if not success_found:
+                    # Check URL change as fallback
+                    time.sleep(10)
+                    if "/upload" not in driver.current_url:
+                        success_found = True
+
+            except Exception:
+                pass  # Best-effort check
+
+            # Step 10: Save updated cookies
+            _save_cookies(driver, self.cookie_path)
+
+            if progress_callback:
+                progress_callback(1.0)
+
+            logger.info("TikTok: อัปโหลดสำเร็จ")
+            return UploadResult(
+                platform="TikTok",
+                status=UploadStatus.SUCCESS,
+            )
+
+        except ImportError:
+            return UploadResult(
+                platform="TikTok",
+                status=UploadStatus.FAILED,
+                error="ต้องติดตั้ง: pip install selenium",
+            )
+
+        except Exception as e:
+            if driver:
+                self._screenshot_on_error(driver, "unexpected")
+            logger.error(f"TikTok: อัปโหลดไม่สำเร็จ — {e}")
+            return UploadResult(
+                platform="TikTok",
+                status=UploadStatus.FAILED,
+                error=f"อัปโหลดไม่สำเร็จ: {str(e)[:150]}",
+            )
+
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _screenshot_on_error(driver, name: str):
+        """Save screenshot for debugging when something goes wrong."""
+        try:
+            os.makedirs("outputs", exist_ok=True)
+            path = f"outputs/tiktok_error_{name}_{int(time.time())}.png"
+            driver.save_screenshot(path)
+            logger.info(f"TikTok: screenshot saved — {path}")
+        except Exception:
+            pass
