@@ -51,6 +51,10 @@ from python.mood_detector import MoodDetector, extract_metadata_from_title
 from python.kie_generator import KieAIGenerator
 from python.gemini_generator import GeminiImageGenerator
 from python.video_composer import VideoComposer, compose_complete_short
+from python.uploaders import UploadRequest, UploadResult, UploadStatus, get_output_videos
+from python.uploaders.youtube_uploader import YouTubeUploader
+from python.uploaders.tiktok_uploader import TikTokUploader
+from python.uploaders.facebook_uploader import FacebookUploader
 
 # ---------------------------------------------------------------------------
 # Config
@@ -179,11 +183,13 @@ class HookToShortApp(ctk.CTk):
         self.tab_download = self.tabview.add("ดาวน์โหลด")
         self.tab_library = self.tabview.add("คลังเพลง")
         self.tab_create = self.tabview.add("สร้างวิดีโอสั้น")
+        self.tab_upload = self.tabview.add("อัปโหลด")
         self.tab_settings = self.tabview.add("ตั้งค่า")
 
         self._build_download_tab()
         self._build_library_tab()
         self._build_create_tab()
+        self._build_upload_tab()
         self._build_settings_tab()
 
         # --- Load saved settings ---
@@ -262,16 +268,24 @@ class HookToShortApp(ctk.CTk):
             self.font_style_var.set(s["font_style"])
         if "font_angle" in s:
             self.font_angle_var.set(s["font_angle"])
+        # Upload tab
+        if "upload_tags" in s:
+            self.upload_tags_var.set(s["upload_tags"])
+        if "upload_privacy" in s:
+            self.upload_privacy_var.set(s["upload_privacy"])
 
     def _save_user_settings(self):
-        s = {
+        s = load_settings()  # Preserve upload credentials
+        s.update({
             "scan_limit": self.scan_limit_var.get(),
             "hook_length": self.hook_length_var.get(),
             "video_style": self.style_var.get(),
             "platform": self.platform_var.get(),
             "font_style": self.font_style_var.get(),
             "font_angle": self.font_angle_var.get(),
-        }
+            "upload_tags": self.upload_tags_var.get(),
+            "upload_privacy": self.upload_privacy_var.get(),
+        })
         save_settings(s)
 
     def _on_close(self):
@@ -1110,6 +1124,279 @@ class HookToShortApp(ctk.CTk):
             subprocess.Popen(["xdg-open", folder])
 
     # -----------------------------------------------------------------------
+    # Upload Tab
+    # -----------------------------------------------------------------------
+
+    def _build_upload_tab(self):
+        tab = self.tab_upload
+
+        # Video selector
+        sel_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        sel_frame.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(sel_frame, text="เลือกวิดีโอ:", font=self._font(13)).pack(side="left", padx=(0, 6))
+
+        self.upload_video_var = ctk.StringVar(value="")
+        self.upload_video_dropdown = ctk.CTkComboBox(
+            sel_frame, variable=self.upload_video_var, values=[], width=380,
+            state="readonly", font=self._font(13), dropdown_font=self._font(13),
+        )
+        self.upload_video_dropdown.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        ctk.CTkButton(sel_frame, text="รีเฟรช", width=70, font=self._font(12),
+                       command=self._refresh_upload_videos).pack(side="right")
+
+        # Video info
+        self.upload_info_label = ctk.CTkLabel(tab, text="", font=self._font(11),
+                                               text_color="gray", anchor="w")
+        self.upload_info_label.pack(fill="x", padx=8, pady=(0, 4))
+
+        self.upload_video_var.trace_add("write", lambda *_: self._on_upload_video_changed())
+
+        # Title
+        title_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        title_frame.pack(fill="x", padx=8, pady=(4, 2))
+        ctk.CTkLabel(title_frame, text="ชื่อ:", font=self._font(13), width=80, anchor="w").pack(side="left")
+        self.upload_title_var = ctk.StringVar(value="")
+        ctk.CTkEntry(title_frame, textvariable=self.upload_title_var, font=self._font(13)).pack(
+            side="left", fill="x", expand=True)
+
+        # Description
+        desc_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        desc_frame.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(desc_frame, text="คำอธิบาย:", font=self._font(13), width=80, anchor="w").pack(side="left")
+        self.upload_desc_textbox = ctk.CTkTextbox(desc_frame, height=50, font=self._font(12), wrap="word")
+        self.upload_desc_textbox.pack(side="left", fill="x", expand=True)
+
+        # Hashtags
+        tags_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        tags_frame.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(tags_frame, text="แฮชแท็ก:", font=self._font(13), width=80, anchor="w").pack(side="left")
+        self.upload_tags_var = ctk.StringVar(value="Shorts, เพลง, เพลงไทย, HookToShort")
+        ctk.CTkEntry(tags_frame, textvariable=self.upload_tags_var, font=self._font(13),
+                     placeholder_text="คั่นด้วย comma").pack(side="left", fill="x", expand=True)
+
+        # Privacy
+        priv_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        priv_frame.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(priv_frame, text="ความเป็นส่วนตัว:", font=self._font(13), width=120, anchor="w").pack(side="left")
+        self.upload_privacy_var = ctk.StringVar(value="public")
+        ctk.CTkComboBox(priv_frame, variable=self.upload_privacy_var,
+                        values=["public", "private", "unlisted"],
+                        width=140, state="readonly", font=self._font(13)).pack(side="left")
+
+        # Platform toggles
+        plat_frame = ctk.CTkFrame(tab)
+        plat_frame.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(plat_frame, text="แพลตฟอร์ม:", font=self._font(13, "bold")).pack(
+            anchor="w", padx=8, pady=(6, 4))
+
+        plat_inner = ctk.CTkFrame(plat_frame, fg_color="transparent")
+        plat_inner.pack(fill="x", padx=8, pady=(0, 6))
+
+        self.upload_yt_var = ctk.BooleanVar(value=True)
+        self.upload_tt_var = ctk.BooleanVar(value=False)
+        self.upload_fb_var = ctk.BooleanVar(value=False)
+
+        yt_col = ctk.CTkFrame(plat_inner, fg_color="transparent")
+        yt_col.pack(side="left", expand=True, fill="x")
+        ctk.CTkCheckBox(yt_col, text="YouTube Shorts", variable=self.upload_yt_var,
+                        font=self._font(13)).pack(anchor="w")
+        self.yt_status_label = ctk.CTkLabel(yt_col, text="", font=self._font(11), text_color="gray")
+        self.yt_status_label.pack(anchor="w", padx=(26, 0))
+
+        tt_col = ctk.CTkFrame(plat_inner, fg_color="transparent")
+        tt_col.pack(side="left", expand=True, fill="x")
+        ctk.CTkCheckBox(tt_col, text="TikTok", variable=self.upload_tt_var,
+                        font=self._font(13)).pack(anchor="w")
+        self.tt_status_label = ctk.CTkLabel(tt_col, text="", font=self._font(11), text_color="gray")
+        self.tt_status_label.pack(anchor="w", padx=(26, 0))
+
+        fb_col = ctk.CTkFrame(plat_inner, fg_color="transparent")
+        fb_col.pack(side="left", expand=True, fill="x")
+        ctk.CTkCheckBox(fb_col, text="Facebook Reels", variable=self.upload_fb_var,
+                        font=self._font(13)).pack(anchor="w")
+        self.fb_status_label = ctk.CTkLabel(fb_col, text="", font=self._font(11), text_color="gray")
+        self.fb_status_label.pack(anchor="w", padx=(26, 0))
+
+        # Upload button
+        self.upload_btn = ctk.CTkButton(tab, text="อัปโหลด", width=180,
+                                         font=self._font(14, "bold"), command=self._on_upload)
+        self.upload_btn.pack(pady=(8, 4))
+
+        # Upload progress
+        self.upload_progress = ctk.CTkLabel(tab, text="", font=self._font(13),
+                                             wraplength=700, justify="left")
+        self.upload_progress.pack(anchor="w", padx=8, pady=(2, 2))
+
+        # Upload results
+        self.upload_result_frame = ctk.CTkFrame(tab)
+        self.upload_result_frame.pack(fill="x", padx=8, pady=4)
+        self.upload_result_label = ctk.CTkLabel(self.upload_result_frame, text="",
+                                                 justify="left", anchor="w", font=self._font(13))
+        self.upload_result_label.pack(fill="x", padx=8, pady=6)
+        self.upload_result_frame.pack_forget()
+
+        # Initialize
+        self._refresh_upload_videos()
+        self._update_platform_status()
+
+    def _refresh_upload_videos(self):
+        videos = get_output_videos(OUTPUTS_FOLDER)
+        values = [v["filename"] for v in videos]
+        self.upload_video_dropdown.configure(values=values if values else ["(ยังไม่มีวิดีโอ)"])
+        if values:
+            self.upload_video_var.set(values[0])
+        else:
+            self.upload_video_var.set("(ยังไม่มีวิดีโอ)")
+
+    def _on_upload_video_changed(self):
+        fname = self.upload_video_var.get()
+        if fname == "(ยังไม่มีวิดีโอ)":
+            self.upload_info_label.configure(text="")
+            self.upload_title_var.set("")
+            return
+        videos = get_output_videos(OUTPUTS_FOLDER)
+        vid = next((v for v in videos if v["filename"] == fname), None)
+        if vid:
+            self.upload_info_label.configure(text=f"ขนาด: {vid['size_mb']} MB  |  {vid['path']}")
+            self.upload_title_var.set(vid["title"])
+
+    def _update_platform_status(self):
+        """Update configuration status labels for each platform."""
+        # YouTube
+        yt = YouTubeUploader()
+        if yt.is_configured():
+            self.yt_status_label.configure(text="พร้อม (client_secrets.json)", text_color="#2ecc71")
+        else:
+            self.yt_status_label.configure(text="ยังไม่ตั้งค่า", text_color="#e67e22")
+
+        # TikTok
+        s = load_settings()
+        tt_key = s.get("tiktok_client_key", "")
+        tt_secret = s.get("tiktok_client_secret", "")
+        if tt_key and tt_secret:
+            self.tt_status_label.configure(text="พร้อม", text_color="#2ecc71")
+        else:
+            self.tt_status_label.configure(text="ยังไม่ตั้งค่า", text_color="#e67e22")
+
+        # Facebook
+        fb_id = s.get("facebook_page_id", "")
+        fb_token = s.get("facebook_access_token", "")
+        if fb_id and fb_token:
+            self.fb_status_label.configure(text="พร้อม", text_color="#2ecc71")
+        else:
+            self.fb_status_label.configure(text="ยังไม่ตั้งค่า", text_color="#e67e22")
+
+    def _on_upload(self):
+        fname = self.upload_video_var.get()
+        if not fname or fname == "(ยังไม่มีวิดีโอ)":
+            self.upload_progress.configure(text="กรุณาเลือกวิดีโอก่อน")
+            return
+
+        video_path = os.path.join(OUTPUTS_FOLDER, fname)
+        if not os.path.exists(video_path):
+            self.upload_progress.configure(text=f"ไม่พบไฟล์: {fname}")
+            return
+
+        # Check at least one platform selected
+        platforms = []
+        if self.upload_yt_var.get():
+            platforms.append("youtube")
+        if self.upload_tt_var.get():
+            platforms.append("tiktok")
+        if self.upload_fb_var.get():
+            platforms.append("facebook")
+
+        if not platforms:
+            self.upload_progress.configure(text="กรุณาเลือกอย่างน้อย 1 แพลตฟอร์ม")
+            return
+
+        title = self.upload_title_var.get().strip() or fname.replace("_short.mp4", "")
+        description = self.upload_desc_textbox.get("1.0", "end").strip()
+        tags_raw = self.upload_tags_var.get().strip()
+        tags = [t.strip().replace("#", "") for t in tags_raw.split(",") if t.strip()]
+        privacy = self.upload_privacy_var.get()
+
+        request = UploadRequest(
+            video_path=video_path,
+            title=title,
+            description=description,
+            tags=tags,
+            privacy=privacy,
+        )
+
+        self.upload_btn.configure(state="disabled")
+        self.upload_result_frame.pack_forget()
+        self.upload_progress.configure(text="เริ่มอัปโหลด...")
+        self.status_var.set("กำลังอัปโหลด...")
+
+        def task():
+            results = []
+            total = len(platforms)
+
+            for idx, platform in enumerate(platforms):
+                step = f"({idx + 1}/{total})"
+
+                if platform == "youtube":
+                    self._upload_step(f"{step} YouTube: กำลังอัปโหลด...")
+                    yt = YouTubeUploader()
+                    result = yt.upload(request)
+                    results.append(result)
+
+                elif platform == "tiktok":
+                    self._upload_step(f"{step} TikTok: กำลังอัปโหลด...")
+                    s = load_settings()
+                    tt = TikTokUploader(
+                        client_key=s.get("tiktok_client_key", ""),
+                        client_secret=s.get("tiktok_client_secret", ""),
+                    )
+                    result = tt.upload(request)
+                    results.append(result)
+
+                elif platform == "facebook":
+                    self._upload_step(f"{step} Facebook: กำลังอัปโหลด...")
+                    s = load_settings()
+                    fb = FacebookUploader(
+                        page_id=s.get("facebook_page_id", ""),
+                        access_token=s.get("facebook_access_token", ""),
+                    )
+                    result = fb.upload(request)
+                    results.append(result)
+
+            self.after(0, lambda r=results: self._upload_done(r))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _upload_step(self, text: str):
+        self.after(0, lambda: self.upload_progress.configure(text=text))
+        self.after(0, lambda: self.status_var.set(text))
+
+    def _upload_done(self, results: list[UploadResult]):
+        self.upload_btn.configure(state="normal")
+
+        lines = []
+        success_count = 0
+        for r in results:
+            icon = "OK" if r.status == UploadStatus.SUCCESS else "FAIL"
+            if r.status == UploadStatus.SUCCESS:
+                success_count += 1
+                line = f"[{icon}] {r.platform}"
+                if r.url:
+                    line += f"  →  {r.url}"
+            else:
+                line = f"[{icon}] {r.platform}  —  {r.error or 'unknown error'}"
+            lines.append(line)
+
+        total = len(results)
+        self.upload_progress.configure(
+            text=f"เสร็จ! สำเร็จ {success_count}/{total} แพลตฟอร์ม")
+        self.upload_result_label.configure(text="\n".join(lines))
+        self.upload_result_frame.pack(fill="x", padx=8, pady=4)
+        self.status_var.set(f"อัปโหลดเสร็จ — {success_count}/{total}")
+
+    # -----------------------------------------------------------------------
     # Settings Tab
     # -----------------------------------------------------------------------
 
@@ -1155,6 +1442,49 @@ class HookToShortApp(ctk.CTk):
         )
         self._gemini_toggle_btn.pack(side="left")
 
+        # --- Upload API Settings ---
+        ctk.CTkLabel(tab, text="Upload API", font=self._font(16, "bold")).pack(
+            anchor="w", padx=12, pady=(16, 8)
+        )
+
+        # YouTube — just shows status (needs client_secrets.json file)
+        yt_info = ctk.CTkFrame(tab, fg_color="transparent")
+        yt_info.pack(fill="x", padx=12, pady=(0, 4))
+        ctk.CTkLabel(yt_info, text="YouTube:", font=self._font(13), width=140, anchor="w").pack(side="left")
+        yt_configured = os.path.exists("client_secrets.json")
+        yt_text = "พร้อม (client_secrets.json)" if yt_configured else "วาง client_secrets.json ใน project folder"
+        yt_color = "#2ecc71" if yt_configured else "#e67e22"
+        ctk.CTkLabel(yt_info, text=yt_text, font=self._font(12), text_color=yt_color).pack(side="left")
+
+        # TikTok Client Key
+        tt_key_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        tt_key_frame.pack(fill="x", padx=12, pady=(0, 3))
+        ctk.CTkLabel(tt_key_frame, text="TikTok Client Key:", font=self._font(13), width=140, anchor="w").pack(side="left")
+        saved = load_settings()
+        self._tt_key_var = ctk.StringVar(value=saved.get("tiktok_client_key", ""))
+        ctk.CTkEntry(tt_key_frame, textvariable=self._tt_key_var, width=380, font=self._font(13), show="*").pack(side="left")
+
+        # TikTok Client Secret
+        tt_sec_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        tt_sec_frame.pack(fill="x", padx=12, pady=(0, 6))
+        ctk.CTkLabel(tt_sec_frame, text="TikTok Secret:", font=self._font(13), width=140, anchor="w").pack(side="left")
+        self._tt_secret_var = ctk.StringVar(value=saved.get("tiktok_client_secret", ""))
+        ctk.CTkEntry(tt_sec_frame, textvariable=self._tt_secret_var, width=380, font=self._font(13), show="*").pack(side="left")
+
+        # Facebook Page ID
+        fb_id_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        fb_id_frame.pack(fill="x", padx=12, pady=(0, 3))
+        ctk.CTkLabel(fb_id_frame, text="Facebook Page ID:", font=self._font(13), width=140, anchor="w").pack(side="left")
+        self._fb_page_id_var = ctk.StringVar(value=saved.get("facebook_page_id", ""))
+        ctk.CTkEntry(fb_id_frame, textvariable=self._fb_page_id_var, width=380, font=self._font(13)).pack(side="left")
+
+        # Facebook Access Token
+        fb_tok_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        fb_tok_frame.pack(fill="x", padx=12, pady=(0, 6))
+        ctk.CTkLabel(fb_tok_frame, text="Facebook Token:", font=self._font(13), width=140, anchor="w").pack(side="left")
+        self._fb_token_var = ctk.StringVar(value=saved.get("facebook_access_token", ""))
+        ctk.CTkEntry(fb_tok_frame, textvariable=self._fb_token_var, width=380, font=self._font(13), show="*").pack(side="left")
+
         # --- Save button + status ---
         save_frame = ctk.CTkFrame(tab, fg_color="transparent")
         save_frame.pack(fill="x", padx=12, pady=(8, 4))
@@ -1178,6 +1508,7 @@ class HookToShortApp(ctk.CTk):
         self._gemini_toggle_btn.configure(text="ซ่อน" if self._gemini_show else "แสดง")
 
     def _on_save_settings(self):
+        # Save API keys to .env
         keys = {
             "KIE_API_KEY": self._kie_key_var.get().strip(),
             "GEMINI_API_KEY": self._gemini_key_var.get().strip(),
@@ -1186,9 +1517,21 @@ class HookToShortApp(ctk.CTk):
             self._save_env(keys)
             for k, v in keys.items():
                 os.environ[k] = v
-            self._settings_status.configure(text="บันทึกแล้ว", text_color="#2ecc71")
         except Exception as e:
             self._settings_status.configure(text=f"ผิดพลาด: {e}", text_color="#e74c3c")
+            return
+
+        # Save upload credentials to settings.json
+        s = load_settings()
+        s["tiktok_client_key"] = self._tt_key_var.get().strip()
+        s["tiktok_client_secret"] = self._tt_secret_var.get().strip()
+        s["facebook_page_id"] = self._fb_page_id_var.get().strip()
+        s["facebook_access_token"] = self._fb_token_var.get().strip()
+        save_settings(s)
+
+        self._settings_status.configure(text="บันทึกแล้ว", text_color="#2ecc71")
+        # Refresh upload tab status
+        self._update_platform_status()
 
     @staticmethod
     def _save_env(updates: dict):

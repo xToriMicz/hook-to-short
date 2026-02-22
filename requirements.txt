@@ -10,3 +10,6 @@ requests>=2.28.0
 python-dotenv>=0.21.0
 pillow>=9.0.0,<12
 customtkinter>=5.2.0
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.0
