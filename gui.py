@@ -1558,11 +1558,24 @@ class HookToShortApp(ctk.CTk):
     def _upload_single(self, video_path: str, title: str, description: str,
                        tags: list[str], privacy: str, platforms: list[str],
                        step_prefix: str = "") -> list[UploadResult]:
-        """Upload one video to selected platforms. Called from background thread."""
-        request = UploadRequest(
+        """Upload one video to selected platforms. Called from background thread.
+
+        Note: Facebook & YouTube use title only (no description/promo link).
+        TikTok gets the full description with promo link.
+        """
+        # TikTok: full description (with promo link)
+        tiktok_request = UploadRequest(
             video_path=video_path,
             title=title,
             description=description,
+            tags=tags,
+            privacy=privacy,
+        )
+        # Facebook & YouTube: title only — promo link & description ใช้ไม่ได้
+        title_only_request = UploadRequest(
+            video_path=video_path,
+            title=title,
+            description="",
             tags=tags,
             privacy=privacy,
         )
@@ -1576,13 +1589,13 @@ class HookToShortApp(ctk.CTk):
                 self._upload_step(f"{step} YouTube: กำลังอัปโหลด...")
                 yt = YouTubeUploader()
                 result = upload_with_retry(
-                    lambda: yt.upload(request, progress_callback=self._upload_progress_callback))
+                    lambda: yt.upload(title_only_request, progress_callback=self._upload_progress_callback))
                 results.append(result)
             elif platform == "tiktok":
                 self._upload_step(f"{step} TikTok: กำลังอัปโหลด...")
                 tt = TikTokBrowserUploader()
                 result = upload_with_retry(
-                    lambda: tt.upload(request, progress_callback=self._upload_progress_callback))
+                    lambda: tt.upload(tiktok_request, progress_callback=self._upload_progress_callback))
                 results.append(result)
             elif platform == "facebook":
                 self._upload_step(f"{step} Facebook: กำลังอัปโหลด...")
@@ -1592,7 +1605,7 @@ class HookToShortApp(ctk.CTk):
                     access_token=s.get("facebook_access_token", ""),
                 )
                 result = upload_with_retry(
-                    lambda: fb.upload(request, progress_callback=self._upload_progress_callback))
+                    lambda: fb.upload(title_only_request, progress_callback=self._upload_progress_callback))
                 results.append(result)
         return results
 
