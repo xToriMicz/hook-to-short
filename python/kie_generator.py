@@ -57,6 +57,7 @@ class KieAIGenerator:
         font_style: str = 'ลายมือพู่กัน',
         font_angle: str = 'เฉียงขึ้น',
         artist: str = '',
+        custom_prompt: str = '',
     ) -> Optional[str]:
         """
         Generate album art image from song info
@@ -67,7 +68,7 @@ class KieAIGenerator:
         try:
             logger.info(f"Generating album art for: {song_title} by {artist} (style: {video_style}, font: {font_style})")
 
-            prompt = self._build_prompt(song_title, mood, intensity, video_style, font_style, font_angle, artist)
+            prompt = custom_prompt or self._build_prompt(song_title, mood, intensity, video_style, font_style, font_angle, artist)
 
             payload = {
                 "model": self.MODEL,
@@ -100,16 +101,18 @@ class KieAIGenerator:
             result = response.json()
 
             # Async API — extract task ID and poll for result
+            data = result.get("data") or {}
             task_id = (
-                result.get("data", {}).get("taskId")
+                data.get("taskId")
                 or result.get("taskId")
                 or result.get("id")
             )
 
             # If response already contains an image URL, use it directly
+            output = data.get("output") or {}
             image_url = (
-                result.get("data", {}).get("url")
-                or result.get("data", {}).get("output", {}).get("image_url")
+                data.get("url")
+                or output.get("image_url")
             )
             if image_url:
                 return self._download_image(image_url, output_path, song_title)

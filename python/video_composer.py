@@ -1,24 +1,20 @@
 """
 Video Composition - Combine image + audio into vertical short video
+Uses ffmpeg directly (no moviepy dependency)
 """
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-try:
-    from moviepy import ImageClip, AudioFileClip, CompositeVideoClip, vfx
-    MOVIEPY_AVAILABLE = True
-except ImportError:
-    MOVIEPY_AVAILABLE = False
-    logger.warning("moviepy not available - install with: pip install moviepy")
-
 
 class VideoComposer:
-    """Compose short videos from images and audio"""
-    
+    """Compose short videos from images and audio using ffmpeg"""
+
     PLATFORMS = {
         'tiktok': {
             'resolution': (1080, 1920),
@@ -39,11 +35,7 @@ class VideoComposer:
             'audio_bitrate': '128k',
         },
     }
-    
-    def __init__(self):
-        if not MOVIEPY_AVAILABLE:
-            raise ImportError("moviepy is required for video composition")
-    
+
     def create_short_video(
         self,
         image_path: str,
@@ -54,90 +46,85 @@ class VideoComposer:
         add_watermark: bool = False
     ) -> Optional[str]:
         """
-        Create short video from image + audio
-        
-        Args:
-            image_path: Path to generated image
-            audio_path: Path to extracted hook audio
-            output_path: Where to save video
-            song_title: Song title for watermark/credit
-            platform: 'tiktok', 'reels', 'youtube-short'
-            add_watermark: Add watermark text
-        
+        Create short video from image + audio using ffmpeg.
+
         Returns:
             Path to created video or None if failed
         """
         try:
-            logger.info(f"🎬 Creating short video: {song_title}")
-            
+            logger.info(f"Creating short video: {song_title}")
+
             if not Path(image_path).exists():
                 logger.error(f"Image not found: {image_path}")
                 return None
-            
+
             if not Path(audio_path).exists():
                 logger.error(f"Audio not found: {audio_path}")
                 return None
-            
-            # Get platform settings
+
             settings = self.PLATFORMS.get(platform, self.PLATFORMS['tiktok'])
-            
-            # Load audio
-            logger.info(f"Loading audio: {audio_path}")
-            audio = AudioFileClip(audio_path)
-            duration = audio.duration
-
-            # Load and resize image to fit platform
-            logger.info(f"Loading image: {image_path}")
             width, height = settings['resolution']
-            image = (
-                ImageClip(image_path, duration=duration)
-                .resized((width, height))
-                .with_effects([
-                    vfx.FadeIn(0.5),
-                    vfx.FadeOut(0.5),
-                ])
-            )
 
-            # Create final video with audio
-            logger.info("Adding audio...")
-            final_video = image.with_audio(audio)
-            
-            # Export video
-            logger.info(f"💾 Exporting video to: {output_path}")
-            
             output_file = Path(output_path)
             output_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            final_video.write_videofile(
+
+            # Get audio duration for fade-out calculation
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0",
+                audio_path,
+            ]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+            duration = float(probe_result.stdout.strip())
+            fade_out = max(0, duration - 0.5)
+
+            # ffmpeg: loop image + overlay audio, fade in/out, fit to 9:16
+            cmd = [
+                "ffmpeg", "-y",
+                "-loop", "1",
+                "-i", image_path,
+                "-i", audio_path,
+                "-c:v", "libx264",
+                "-tune", "stillimage",
+                "-c:a", "aac",
+                "-b:a", settings['audio_bitrate'],
+                "-b:v", settings['bitrate'],
+                "-r", str(settings['fps']),
+                "-pix_fmt", "yuv420p",
+                "-vf", (
+                    f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+                    f"fade=t=in:st=0:d=0.5,"
+                    f"fade=t=out:st={fade_out}:d=0.5"
+                ),
+                "-af", f"afade=t=in:st=0:d=0.5,afade=t=out:st={fade_out}:d=0.5",
+                "-shortest",
+                "-movflags", "+faststart",
                 output_path,
-                fps=settings['fps'],
-                codec='libx264',
-                audio_codec='aac',
-                bitrate=settings['bitrate'],
-                audio_bitrate=settings['audio_bitrate'],
-                preset='medium',
+            ]
+
+            logger.info(f"Running ffmpeg...")
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300,
             )
-            
-            logger.info(f"✓ Video created: {output_path}")
+
+            if result.returncode != 0:
+                logger.error(f"ffmpeg failed: {result.stderr[-500:]}")
+                return None
+
+            logger.info(f"Video created: {output_path}")
             return output_path
-        
+
+        except subprocess.TimeoutExpired:
+            logger.error("ffmpeg timed out (5 min)")
+            return None
+        except FileNotFoundError:
+            logger.error("ffmpeg not found — install ffmpeg or ensure it's in PATH")
+            return None
         except Exception as e:
             logger.error(f"Error creating video: {e}")
-            import traceback
-            traceback.print_exc()
             return None
-        
-        finally:
-            # Cleanup
-            try:
-                if 'audio' in locals():
-                    audio.close()
-                if 'image' in locals():
-                    image.close()
-                if 'final_video' in locals():
-                    final_video.close()
-            except:
-                pass
 
 
 def compose_complete_short(
@@ -149,51 +136,27 @@ def compose_complete_short(
 ) -> Optional[str]:
     """
     Complete workflow: image + hook → short video
-    
-    Args:
-        image_path: Generated album art
-        hook_audio_path: Extracted hook audio
-        output_path: Output video path
-        song_title: Song title for credits
-        platform: Target platform
-    
+
     Returns:
         Path to completed video
     """
     logger.info("=" * 60)
-    logger.info("🎬 COMPOSING SHORT VIDEO")
+    logger.info("COMPOSING SHORT VIDEO")
     logger.info("=" * 60)
-    
+
     composer = VideoComposer()
-    
+
     result = composer.create_short_video(
         image_path=image_path,
         audio_path=hook_audio_path,
         output_path=output_path,
         song_title=song_title,
         platform=platform,
-        add_watermark=False  # Text already in AI-generated image from Kie.ai
     )
-    
+
     if result:
         logger.info("=" * 60)
-        logger.info(f"✓ SUCCESS: {result}")
+        logger.info(f"SUCCESS: {result}")
         logger.info("=" * 60)
-    
+
     return result
-
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    
-    # Test
-    composer = VideoComposer()
-    
-    # Would need actual paths to test
-    # result = composer.create_short_video(
-    #     image_path="test.png",
-    #     audio_path="test.mp3",
-    #     output_path="output.mp4",
-    #     song_title="Test Song",
-    #     platform='tiktok'
-    # )
