@@ -176,8 +176,19 @@ class YouTubeUploader:
         except Exception as e:
             error_msg = str(e)
             logger.error(f"YouTube: อัปโหลดไม่สำเร็จ — {error_msg}")
+            # Translate common errors
+            if "quota" in error_msg.lower():
+                friendly = "YouTube API quota หมด — ลองอีกครั้งพรุ่งนี้"
+            elif "forbidden" in error_msg.lower() or "403" in error_msg:
+                friendly = "ไม่มีสิทธิ์อัปโหลด — ตรวจสอบ OAuth scope"
+            elif "notFound" in error_msg or "404" in error_msg:
+                friendly = "ไม่พบ channel — ตรวจสอบ account"
+            elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                friendly = "หมดเวลาเชื่อมต่อ — ตรวจสอบอินเทอร์เน็ต"
+            else:
+                friendly = error_msg[:200]
             return UploadResult(
                 platform="YouTube",
                 status=UploadStatus.FAILED,
-                error=error_msg,
+                error=friendly,
             )

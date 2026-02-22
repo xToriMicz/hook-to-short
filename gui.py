@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import warnings
+import webbrowser
 import glob as glob_mod
 from pathlib import Path
 from datetime import datetime
@@ -51,7 +52,7 @@ from python.mood_detector import MoodDetector, extract_metadata_from_title
 from python.kie_generator import KieAIGenerator
 from python.gemini_generator import GeminiImageGenerator
 from python.video_composer import VideoComposer, compose_complete_short
-from python.uploaders import UploadRequest, UploadResult, UploadStatus, get_output_videos
+from python.uploaders import UploadRequest, UploadResult, UploadStatus, get_output_videos, upload_with_retry
 from python.uploaders.youtube_uploader import YouTubeUploader
 from python.uploaders.tiktok_uploader import TikTokUploader
 from python.uploaders.facebook_uploader import FacebookUploader
@@ -64,6 +65,7 @@ DOWNLOADS_FOLDER = "./downloads"
 OUTPUTS_FOLDER = "./outputs"
 TRACKS_DB = "tracks.json"
 SETTINGS_FILE = "settings.json"
+UPLOAD_HISTORY_FILE = "upload_history.json"
 
 os.makedirs(DOWNLOADS_FOLDER, exist_ok=True)
 os.makedirs(OUTPUTS_FOLDER, exist_ok=True)
@@ -119,6 +121,48 @@ def _cleanup_temp_hooks():
             pass
 
 
+def _cleanup_temp_folders():
+    """Remove leftover temp_* directories from downloads."""
+    import shutil
+    for d in glob_mod.glob(os.path.join(DOWNLOADS_FOLDER, "temp_*")):
+        if os.path.isdir(d):
+            try:
+                shutil.rmtree(d)
+                logger.info(f"Cleaned up temp folder: {os.path.basename(d)}")
+            except OSError:
+                pass
+
+
+def load_upload_history() -> list:
+    if os.path.exists(UPLOAD_HISTORY_FILE):
+        try:
+            with open(UPLOAD_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def save_upload_history(history: list):
+    with open(UPLOAD_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+def add_upload_record(video_filename: str, results: list):
+    """Save upload results to history."""
+    history = load_upload_history()
+    for r in results:
+        history.append({
+            "timestamp": datetime.now().isoformat(),
+            "video": video_filename,
+            "platform": r.platform,
+            "status": r.status.value,
+            "url": r.url or "",
+            "error": r.error or "",
+        })
+    save_upload_history(history)
+
+
 def load_settings() -> dict:
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -144,6 +188,7 @@ class HookToShortApp(ctk.CTk):
 
         # Clean up leftover temp files on startup
         _cleanup_temp_hooks()
+        _cleanup_temp_folders()
 
         self.title("Hook-to-Short")
         self.geometry("780x750")
@@ -185,6 +230,8 @@ class HookToShortApp(ctk.CTk):
         self.tab_create = self.tabview.add("สร้างวิดีโอสั้น")
         self.tab_upload = self.tabview.add("อัปโหลด")
         self.tab_settings = self.tabview.add("ตั้งค่า")
+
+        self.auto_upload_var = ctk.BooleanVar(value=False)
 
         self._build_download_tab()
         self._build_library_tab()
@@ -273,6 +320,8 @@ class HookToShortApp(ctk.CTk):
             self.upload_tags_var.set(s["upload_tags"])
         if "upload_privacy" in s:
             self.upload_privacy_var.set(s["upload_privacy"])
+        if "auto_upload" in s:
+            self.auto_upload_var.set(s["auto_upload"])
 
     def _save_user_settings(self):
         s = load_settings()  # Preserve upload credentials
@@ -285,6 +334,7 @@ class HookToShortApp(ctk.CTk):
             "font_angle": self.font_angle_var.get(),
             "upload_tags": self.upload_tags_var.get(),
             "upload_privacy": self.upload_privacy_var.get(),
+            "auto_upload": self.auto_upload_var.get(),
         })
         save_settings(s)
 
@@ -419,6 +469,7 @@ class HookToShortApp(ctk.CTk):
                 safe_name = self._sanitize_filename(song_title) + ".mp3"
                 final_path = os.path.join(DOWNLOADS_FOLDER, safe_name)
                 os.replace(os.path.join(temp_folder, mp3_file), final_path)
+                _cleanup_temp_folders()
 
                 file_size = os.path.getsize(final_path) / (1024 * 1024)
 
@@ -626,6 +677,7 @@ class HookToShortApp(ctk.CTk):
                     song_title = mp3_file.replace(".mp3", "")
                     final_path = os.path.join(DOWNLOADS_FOLDER, mp3_file)
                     os.replace(os.path.join(temp_folder, mp3_file), final_path)
+                    _cleanup_temp_folders()
 
                     file_size = os.path.getsize(final_path) / (1024 * 1024)
                     add_track({
@@ -1104,6 +1156,51 @@ class HookToShortApp(ctk.CTk):
         self.gen_result_frame.pack(fill="x", padx=8, pady=4)
         self.status_var.set(f"สร้างเสร็จ: {result['song_title']}")
 
+        # Auto-upload if enabled
+        if self.auto_upload_var.get():
+            self._auto_upload_video(result['video_path'], result['song_title'])
+
+    def _auto_upload_video(self, video_path: str, title: str):
+        """Trigger upload for a newly created video using upload tab settings."""
+        platforms = []
+        if self.upload_yt_var.get():
+            platforms.append("youtube")
+        if self.upload_tt_var.get():
+            platforms.append("tiktok")
+        if self.upload_fb_var.get():
+            platforms.append("facebook")
+
+        if not platforms:
+            self.gen_progress.configure(
+                text="เสร็จสมบูรณ์! (อัปโหลดอัตโนมัติ: ไม่มีแพลตฟอร์มที่เลือก)")
+            return
+
+        tags_raw = self.upload_tags_var.get().strip()
+        tags = [t.strip().replace("#", "") for t in tags_raw.split(",") if t.strip()]
+        privacy = self.upload_privacy_var.get()
+        fname = os.path.basename(video_path)
+
+        self.gen_progress.configure(text="เสร็จสมบูรณ์! กำลังอัปโหลดอัตโนมัติ...")
+        self.status_var.set("อัปโหลดอัตโนมัติ...")
+
+        def task():
+            results = self._upload_single(video_path, title, "", tags, privacy, platforms,
+                                          step_prefix="[auto] ")
+            add_upload_record(fname, results)
+            success = sum(1 for r in results if r.status == UploadStatus.SUCCESS)
+            total = len(results)
+
+            def done():
+                self._refresh_upload_history()
+                self._refresh_upload_videos()
+                self.gen_progress.configure(
+                    text=f"เสร็จสมบูรณ์! อัปโหลดอัตโนมัติ {success}/{total}")
+                self.status_var.set(f"อัปโหลดอัตโนมัติเสร็จ — {success}/{total}")
+
+            self.after(0, done)
+
+        threading.Thread(target=task, daemon=True).start()
+
     def _open_video(self):
         if self._last_video_path and os.path.exists(self._last_video_path):
             path = os.path.abspath(self._last_video_path)
@@ -1130,28 +1227,30 @@ class HookToShortApp(ctk.CTk):
     def _build_upload_tab(self):
         tab = self.tab_upload
 
-        # Video selector
-        sel_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        sel_frame.pack(fill="x", padx=8, pady=(8, 4))
+        # Video selector — multi-select with checkboxes
+        sel_header = ctk.CTkFrame(tab, fg_color="transparent")
+        sel_header.pack(fill="x", padx=8, pady=(8, 2))
 
-        ctk.CTkLabel(sel_frame, text="เลือกวิดีโอ:", font=self._font(13)).pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(sel_header, text="เลือกวิดีโอ:", font=self._font(13)).pack(side="left", padx=(0, 6))
 
-        self.upload_video_var = ctk.StringVar(value="")
-        self.upload_video_dropdown = ctk.CTkComboBox(
-            sel_frame, variable=self.upload_video_var, values=[], width=380,
-            state="readonly", font=self._font(13), dropdown_font=self._font(13),
-        )
-        self.upload_video_dropdown.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._upload_select_all_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(sel_header, text="เลือกทั้งหมด", variable=self._upload_select_all_var,
+                        font=self._font(11), command=self._toggle_select_all_videos).pack(side="left", padx=(8, 0))
 
-        ctk.CTkButton(sel_frame, text="รีเฟรช", width=70, font=self._font(12),
+        ctk.CTkButton(sel_header, text="รีเฟรช", width=70, font=self._font(12),
                        command=self._refresh_upload_videos).pack(side="right")
 
-        # Video info
+        self._upload_video_list_frame = ctk.CTkScrollableFrame(tab, height=80)
+        self._upload_video_list_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self._upload_video_checks: list[tuple[ctk.BooleanVar, str]] = []  # (var, filename)
+
+        # Selected video info
         self.upload_info_label = ctk.CTkLabel(tab, text="", font=self._font(11),
                                                text_color="gray", anchor="w")
         self.upload_info_label.pack(fill="x", padx=8, pady=(0, 4))
 
-        self.upload_video_var.trace_add("write", lambda *_: self._on_upload_video_changed())
+        # Keep upload_video_var for compatibility (stores last/primary selection)
+        self.upload_video_var = ctk.StringVar(value="")
 
         # Title
         title_frame = ctk.CTkFrame(tab, fg_color="transparent")
@@ -1203,22 +1302,52 @@ class HookToShortApp(ctk.CTk):
         yt_col.pack(side="left", expand=True, fill="x")
         ctk.CTkCheckBox(yt_col, text="YouTube Shorts", variable=self.upload_yt_var,
                         font=self._font(13)).pack(anchor="w")
-        self.yt_status_label = ctk.CTkLabel(yt_col, text="", font=self._font(11), text_color="gray")
-        self.yt_status_label.pack(anchor="w", padx=(26, 0))
+        yt_status_row = ctk.CTkFrame(yt_col, fg_color="transparent")
+        yt_status_row.pack(anchor="w", padx=(26, 0))
+        self.yt_status_label = ctk.CTkLabel(yt_status_row, text="", font=self._font(11), text_color="gray")
+        self.yt_status_label.pack(side="left")
+        self.yt_manual_btn = ctk.CTkButton(
+            yt_status_row, text="อัปโหลดเอง", width=70, height=20, font=self._font(10),
+            fg_color="transparent", text_color="#3498db", hover_color=("gray85", "gray30"),
+            command=lambda: webbrowser.open("https://studio.youtube.com/"))
+        self.yt_manual_btn.pack(side="left", padx=(4, 0))
+        self.yt_manual_btn.pack_forget()
 
         tt_col = ctk.CTkFrame(plat_inner, fg_color="transparent")
         tt_col.pack(side="left", expand=True, fill="x")
         ctk.CTkCheckBox(tt_col, text="TikTok", variable=self.upload_tt_var,
                         font=self._font(13)).pack(anchor="w")
-        self.tt_status_label = ctk.CTkLabel(tt_col, text="", font=self._font(11), text_color="gray")
-        self.tt_status_label.pack(anchor="w", padx=(26, 0))
+        tt_status_row = ctk.CTkFrame(tt_col, fg_color="transparent")
+        tt_status_row.pack(anchor="w", padx=(26, 0))
+        self.tt_status_label = ctk.CTkLabel(tt_status_row, text="", font=self._font(11), text_color="gray")
+        self.tt_status_label.pack(side="left")
+        self.tt_manual_btn = ctk.CTkButton(
+            tt_status_row, text="อัปโหลดเอง", width=70, height=20, font=self._font(10),
+            fg_color="transparent", text_color="#3498db", hover_color=("gray85", "gray30"),
+            command=lambda: webbrowser.open("https://www.tiktok.com/upload"))
+        self.tt_manual_btn.pack(side="left", padx=(4, 0))
+        self.tt_manual_btn.pack_forget()
 
         fb_col = ctk.CTkFrame(plat_inner, fg_color="transparent")
         fb_col.pack(side="left", expand=True, fill="x")
         ctk.CTkCheckBox(fb_col, text="Facebook Reels", variable=self.upload_fb_var,
                         font=self._font(13)).pack(anchor="w")
-        self.fb_status_label = ctk.CTkLabel(fb_col, text="", font=self._font(11), text_color="gray")
-        self.fb_status_label.pack(anchor="w", padx=(26, 0))
+        fb_status_row = ctk.CTkFrame(fb_col, fg_color="transparent")
+        fb_status_row.pack(anchor="w", padx=(26, 0))
+        self.fb_status_label = ctk.CTkLabel(fb_status_row, text="", font=self._font(11), text_color="gray")
+        self.fb_status_label.pack(side="left")
+        self.fb_manual_btn = ctk.CTkButton(
+            fb_status_row, text="อัปโหลดเอง", width=70, height=20, font=self._font(10),
+            fg_color="transparent", text_color="#3498db", hover_color=("gray85", "gray30"),
+            command=lambda: webbrowser.open("https://business.facebook.com/latest/content_calendar"))
+        self.fb_manual_btn.pack(side="left", padx=(4, 0))
+        self.fb_manual_btn.pack_forget()
+
+        # Auto-upload toggle
+        auto_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        auto_frame.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkCheckBox(auto_frame, text="อัปโหลดอัตโนมัติหลังสร้างวิดีโอ",
+                        variable=self.auto_upload_var, font=self._font(12)).pack(side="left")
 
         # Upload button
         self.upload_btn = ctk.CTkButton(tab, text="อัปโหลด", width=180,
@@ -1235,33 +1364,83 @@ class HookToShortApp(ctk.CTk):
         self.upload_result_frame.pack(fill="x", padx=8, pady=4)
         self.upload_result_label = ctk.CTkLabel(self.upload_result_frame, text="",
                                                  justify="left", anchor="w", font=self._font(13))
-        self.upload_result_label.pack(fill="x", padx=8, pady=6)
+        self.upload_result_label.pack(fill="x", padx=8, pady=(6, 2))
+        self.upload_retry_btn = ctk.CTkButton(
+            self.upload_result_frame, text="ลองอีกครั้ง", width=100, font=self._font(12),
+            command=self._on_upload)
+        self.upload_retry_btn.pack(padx=8, pady=(0, 6), anchor="w")
+        self.upload_retry_btn.pack_forget()
         self.upload_result_frame.pack_forget()
+
+        # Upload history
+        hist_header = ctk.CTkFrame(tab, fg_color="transparent")
+        hist_header.pack(fill="x", padx=8, pady=(8, 2))
+        ctk.CTkLabel(hist_header, text="ประวัติอัปโหลด", font=self._font(14, "bold")).pack(side="left")
+
+        self.upload_history_box = ctk.CTkTextbox(tab, height=120, font=self._font(11),
+                                                  state="disabled", wrap="word")
+        self.upload_history_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         # Initialize
         self._refresh_upload_videos()
         self._update_platform_status()
+        self._refresh_upload_history()
 
     def _refresh_upload_videos(self):
         videos = get_output_videos(OUTPUTS_FOLDER)
-        values = [v["filename"] for v in videos]
-        self.upload_video_dropdown.configure(values=values if values else ["(ยังไม่มีวิดีโอ)"])
-        if values:
-            self.upload_video_var.set(values[0])
-        else:
-            self.upload_video_var.set("(ยังไม่มีวิดีโอ)")
+        # Clear existing checkboxes
+        for widget in self._upload_video_list_frame.winfo_children():
+            widget.destroy()
+        self._upload_video_checks.clear()
+        self._upload_select_all_var.set(False)
 
-    def _on_upload_video_changed(self):
-        fname = self.upload_video_var.get()
-        if fname == "(ยังไม่มีวิดีโอ)":
+        if not videos:
+            ctk.CTkLabel(self._upload_video_list_frame, text="(ยังไม่มีวิดีโอ)",
+                         font=self._font(11), text_color="gray").pack(anchor="w")
             self.upload_info_label.configure(text="")
             self.upload_title_var.set("")
+            self.upload_video_var.set("")
             return
-        videos = get_output_videos(OUTPUTS_FOLDER)
-        vid = next((v for v in videos if v["filename"] == fname), None)
-        if vid:
-            self.upload_info_label.configure(text=f"ขนาด: {vid['size_mb']} MB  |  {vid['path']}")
-            self.upload_title_var.set(vid["title"])
+
+        for vid in videos:
+            var = ctk.BooleanVar(value=False)
+            row = ctk.CTkFrame(self._upload_video_list_frame, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            ctk.CTkCheckBox(row, text=f"{vid['filename']}  ({vid['size_mb']} MB)",
+                            variable=var, font=self._font(11),
+                            command=self._on_video_check_changed).pack(side="left")
+            self._upload_video_checks.append((var, vid["filename"]))
+
+        # Select first by default
+        if self._upload_video_checks:
+            self._upload_video_checks[0][0].set(True)
+            self._on_video_check_changed()
+
+    def _toggle_select_all_videos(self):
+        val = self._upload_select_all_var.get()
+        for var, _ in self._upload_video_checks:
+            var.set(val)
+        self._on_video_check_changed()
+
+    def _on_video_check_changed(self):
+        selected = [(var, fname) for var, fname in self._upload_video_checks if var.get()]
+        count = len(selected)
+        if count == 0:
+            self.upload_info_label.configure(text="")
+            self.upload_title_var.set("")
+            self.upload_video_var.set("")
+        elif count == 1:
+            fname = selected[0][1]
+            self.upload_video_var.set(fname)
+            videos = get_output_videos(OUTPUTS_FOLDER)
+            vid = next((v for v in videos if v["filename"] == fname), None)
+            if vid:
+                self.upload_info_label.configure(text=f"ขนาด: {vid['size_mb']} MB  |  {vid['path']}")
+                self.upload_title_var.set(vid["title"])
+        else:
+            self.upload_video_var.set(selected[0][1])
+            self.upload_info_label.configure(text=f"เลือก {count} วิดีโอ (batch upload)")
+            self.upload_title_var.set("")
 
     def _update_platform_status(self):
         """Update configuration status labels for each platform."""
@@ -1269,8 +1448,10 @@ class HookToShortApp(ctk.CTk):
         yt = YouTubeUploader()
         if yt.is_configured():
             self.yt_status_label.configure(text="พร้อม (client_secrets.json)", text_color="#2ecc71")
+            self.yt_manual_btn.pack_forget()
         else:
             self.yt_status_label.configure(text="ยังไม่ตั้งค่า", text_color="#e67e22")
+            self.yt_manual_btn.pack(side="left", padx=(4, 0))
 
         # TikTok
         s = load_settings()
@@ -1278,27 +1459,96 @@ class HookToShortApp(ctk.CTk):
         tt_secret = s.get("tiktok_client_secret", "")
         if tt_key and tt_secret:
             self.tt_status_label.configure(text="พร้อม", text_color="#2ecc71")
+            self.tt_manual_btn.pack_forget()
         else:
             self.tt_status_label.configure(text="ยังไม่ตั้งค่า", text_color="#e67e22")
+            self.tt_manual_btn.pack(side="left", padx=(4, 0))
 
         # Facebook
         fb_id = s.get("facebook_page_id", "")
         fb_token = s.get("facebook_access_token", "")
         if fb_id and fb_token:
             self.fb_status_label.configure(text="พร้อม", text_color="#2ecc71")
+            self.fb_manual_btn.pack_forget()
         else:
             self.fb_status_label.configure(text="ยังไม่ตั้งค่า", text_color="#e67e22")
+            self.fb_manual_btn.pack(side="left", padx=(4, 0))
+
+    def _refresh_upload_history(self):
+        history = load_upload_history()
+        self.upload_history_box.configure(state="normal")
+        self.upload_history_box.delete("1.0", "end")
+        if not history:
+            self.upload_history_box.insert("1.0", "(ยังไม่มีประวัติอัปโหลด)")
+        else:
+            # Show most recent first, max 20
+            for entry in reversed(history[-20:]):
+                ts = entry.get("timestamp", "")[:16].replace("T", " ")
+                icon = "OK" if entry.get("status") == "success" else "FAIL"
+                url = entry.get("url", "")
+                line = f"[{ts}] [{icon}] {entry.get('platform', '?')} — {entry.get('video', '?')}"
+                if url:
+                    line += f"  →  {url}"
+                elif entry.get("error"):
+                    line += f"  ({entry['error'][:60]})"
+                self.upload_history_box.insert("end", line + "\n")
+        self.upload_history_box.configure(state="disabled")
+
+    def _get_selected_video_filenames(self) -> list[str]:
+        return [fname for var, fname in self._upload_video_checks if var.get()]
+
+    def _upload_single(self, video_path: str, title: str, description: str,
+                       tags: list[str], privacy: str, platforms: list[str],
+                       step_prefix: str = "") -> list[UploadResult]:
+        """Upload one video to selected platforms. Called from background thread."""
+        request = UploadRequest(
+            video_path=video_path,
+            title=title,
+            description=description,
+            tags=tags,
+            privacy=privacy,
+        )
+        results = []
+        total = len(platforms)
+        for idx, platform in enumerate(platforms):
+            step = f"{step_prefix}({idx + 1}/{total})"
+            if platform == "youtube":
+                self._upload_step(f"{step} YouTube: กำลังอัปโหลด...")
+                yt = YouTubeUploader()
+                result = upload_with_retry(lambda: yt.upload(request))
+                results.append(result)
+            elif platform == "tiktok":
+                self._upload_step(f"{step} TikTok: กำลังอัปโหลด...")
+                s = load_settings()
+                tt = TikTokUploader(
+                    client_key=s.get("tiktok_client_key", ""),
+                    client_secret=s.get("tiktok_client_secret", ""),
+                )
+                result = upload_with_retry(lambda: tt.upload(request))
+                results.append(result)
+            elif platform == "facebook":
+                self._upload_step(f"{step} Facebook: กำลังอัปโหลด...")
+                s = load_settings()
+                fb = FacebookUploader(
+                    page_id=s.get("facebook_page_id", ""),
+                    access_token=s.get("facebook_access_token", ""),
+                )
+                result = upload_with_retry(lambda: fb.upload(request))
+                results.append(result)
+        return results
 
     def _on_upload(self):
-        fname = self.upload_video_var.get()
-        if not fname or fname == "(ยังไม่มีวิดีโอ)":
+        selected_files = self._get_selected_video_filenames()
+        if not selected_files:
             self.upload_progress.configure(text="กรุณาเลือกวิดีโอก่อน")
             return
 
-        video_path = os.path.join(OUTPUTS_FOLDER, fname)
-        if not os.path.exists(video_path):
-            self.upload_progress.configure(text=f"ไม่พบไฟล์: {fname}")
-            return
+        # Verify files exist
+        for fname in selected_files:
+            video_path = os.path.join(OUTPUTS_FOLDER, fname)
+            if not os.path.exists(video_path):
+                self.upload_progress.configure(text=f"ไม่พบไฟล์: {fname}")
+                return
 
         # Check at least one platform selected
         platforms = []
@@ -1313,59 +1563,40 @@ class HookToShortApp(ctk.CTk):
             self.upload_progress.configure(text="กรุณาเลือกอย่างน้อย 1 แพลตฟอร์ม")
             return
 
-        title = self.upload_title_var.get().strip() or fname.replace("_short.mp4", "")
+        # Shared metadata
+        custom_title = self.upload_title_var.get().strip()
         description = self.upload_desc_textbox.get("1.0", "end").strip()
         tags_raw = self.upload_tags_var.get().strip()
         tags = [t.strip().replace("#", "") for t in tags_raw.split(",") if t.strip()]
         privacy = self.upload_privacy_var.get()
-
-        request = UploadRequest(
-            video_path=video_path,
-            title=title,
-            description=description,
-            tags=tags,
-            privacy=privacy,
-        )
 
         self.upload_btn.configure(state="disabled")
         self.upload_result_frame.pack_forget()
         self.upload_progress.configure(text="เริ่มอัปโหลด...")
         self.status_var.set("กำลังอัปโหลด...")
 
+        is_batch = len(selected_files) > 1
+
         def task():
-            results = []
-            total = len(platforms)
+            all_results = []
+            for vid_idx, fname in enumerate(selected_files):
+                video_path = os.path.join(OUTPUTS_FOLDER, fname)
+                # For batch: auto-generate title from filename; for single: use custom title
+                if is_batch:
+                    title = fname.replace("_short.mp4", "").replace("_", " ")
+                    prefix = f"[{vid_idx + 1}/{len(selected_files)}] "
+                    self._upload_step(f"{prefix}{fname}")
+                else:
+                    title = custom_title or fname.replace("_short.mp4", "").replace("_", " ")
+                    prefix = ""
 
-            for idx, platform in enumerate(platforms):
-                step = f"({idx + 1}/{total})"
+                results = self._upload_single(video_path, title, description,
+                                              tags, privacy, platforms, prefix)
+                # Save history per video
+                self.after(0, lambda f=fname, r=list(results): add_upload_record(f, r))
+                all_results.extend(results)
 
-                if platform == "youtube":
-                    self._upload_step(f"{step} YouTube: กำลังอัปโหลด...")
-                    yt = YouTubeUploader()
-                    result = yt.upload(request)
-                    results.append(result)
-
-                elif platform == "tiktok":
-                    self._upload_step(f"{step} TikTok: กำลังอัปโหลด...")
-                    s = load_settings()
-                    tt = TikTokUploader(
-                        client_key=s.get("tiktok_client_key", ""),
-                        client_secret=s.get("tiktok_client_secret", ""),
-                    )
-                    result = tt.upload(request)
-                    results.append(result)
-
-                elif platform == "facebook":
-                    self._upload_step(f"{step} Facebook: กำลังอัปโหลด...")
-                    s = load_settings()
-                    fb = FacebookUploader(
-                        page_id=s.get("facebook_page_id", ""),
-                        access_token=s.get("facebook_access_token", ""),
-                    )
-                    result = fb.upload(request)
-                    results.append(result)
-
-            self.after(0, lambda r=results: self._upload_done(r))
+            self.after(0, lambda r=all_results: self._upload_done_batch(r, len(selected_files)))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -1373,7 +1604,7 @@ class HookToShortApp(ctk.CTk):
         self.after(0, lambda: self.upload_progress.configure(text=text))
         self.after(0, lambda: self.status_var.set(text))
 
-    def _upload_done(self, results: list[UploadResult]):
+    def _upload_done_batch(self, results: list[UploadResult], video_count: int):
         self.upload_btn.configure(state="normal")
 
         lines = []
@@ -1389,11 +1620,22 @@ class HookToShortApp(ctk.CTk):
                 line = f"[{icon}] {r.platform}  —  {r.error or 'unknown error'}"
             lines.append(line)
 
+        self._refresh_upload_history()
+
         total = len(results)
-        self.upload_progress.configure(
-            text=f"เสร็จ! สำเร็จ {success_count}/{total} แพลตฟอร์ม")
+        summary = f"เสร็จ! สำเร็จ {success_count}/{total}"
+        if video_count > 1:
+            summary += f" ({video_count} วิดีโอ)"
+        self.upload_progress.configure(text=summary)
         self.upload_result_label.configure(text="\n".join(lines))
         self.upload_result_frame.pack(fill="x", padx=8, pady=4)
+
+        # Show retry button if any failed
+        if success_count < total:
+            self.upload_retry_btn.pack(padx=8, pady=(0, 6), anchor="w")
+        else:
+            self.upload_retry_btn.pack_forget()
+
         self.status_var.set(f"อัปโหลดเสร็จ — {success_count}/{total}")
 
     # -----------------------------------------------------------------------

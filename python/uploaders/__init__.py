@@ -4,12 +4,16 @@ Hook-to-Short — Social Media Uploaders
 """
 
 import os
+import time
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 2
+RETRY_DELAYS = [5, 15]  # seconds between retries
 
 
 class UploadStatus(Enum):
@@ -36,6 +40,22 @@ class UploadRequest:
     description: str = ""
     tags: list[str] = field(default_factory=list)
     privacy: str = "public"  # public, private, unlisted
+
+
+def upload_with_retry(upload_fn: Callable[[], UploadResult],
+                      max_retries: int = MAX_RETRIES) -> UploadResult:
+    """Retry an upload function on failure with exponential backoff."""
+    last_result = None
+    for attempt in range(1 + max_retries):
+        result = upload_fn()
+        if result.status == UploadStatus.SUCCESS:
+            return result
+        last_result = result
+        if attempt < max_retries:
+            delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+            logger.info(f"{result.platform}: ลองใหม่ครั้งที่ {attempt + 1} (รอ {delay} วินาที)...")
+            time.sleep(delay)
+    return last_result
 
 
 def get_output_videos(outputs_folder: str = "./outputs") -> list[dict]:

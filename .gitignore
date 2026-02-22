@@ -1,6 +1,3 @@
-# Environment & secrets
-.env
-
 # Python
 .venv/
 .venv-1/
@@ -34,6 +31,16 @@ tracks.json
 build/
 dist/
 *.spec
+
+# Credentials & tokens
+settings.json
+client_secrets.json
+youtube_token.json
+tiktok_token.json
+.env
+
+# Runtime data
+upload_history.json
 
 # OS
 Thumbs.db

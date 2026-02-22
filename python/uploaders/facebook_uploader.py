@@ -97,11 +97,17 @@ class FacebookUploader:
             video_id = init_data["video_id"]
             upload_url = init_data.get("upload_url")
 
+        except requests.exceptions.Timeout:
+            return UploadResult(
+                platform="Facebook",
+                status=UploadStatus.FAILED,
+                error="หมดเวลาเชื่อมต่อ Facebook — ตรวจสอบอินเทอร์เน็ต",
+            )
         except Exception as e:
             return UploadResult(
                 platform="Facebook",
                 status=UploadStatus.FAILED,
-                error=f"Init error: {e}",
+                error=f"เริ่มอัปโหลดไม่สำเร็จ: {str(e)[:150]}",
             )
 
         # Step 2: Upload video file
@@ -128,11 +134,17 @@ class FacebookUploader:
                     error=f"Upload failed: HTTP {upload_resp.status_code}",
                 )
 
+        except requests.exceptions.Timeout:
+            return UploadResult(
+                platform="Facebook",
+                status=UploadStatus.FAILED,
+                error="อัปโหลดหมดเวลา — ไฟล์อาจใหญ่เกินไปหรือเน็ตช้า",
+            )
         except Exception as e:
             return UploadResult(
                 platform="Facebook",
                 status=UploadStatus.FAILED,
-                error=f"Upload error: {e}",
+                error=f"อัปโหลดไม่สำเร็จ: {str(e)[:150]}",
             )
 
         # Step 3: Finish — publish the reel
@@ -171,5 +183,5 @@ class FacebookUploader:
             return UploadResult(
                 platform="Facebook",
                 status=UploadStatus.FAILED,
-                error=f"Publish error: {e}",
+                error=f"เผยแพร่ไม่สำเร็จ: {str(e)[:150]}",
             )

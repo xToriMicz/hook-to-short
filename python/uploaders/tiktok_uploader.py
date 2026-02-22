@@ -252,11 +252,17 @@ class TikTokUploader:
             publish_id = data["data"]["publish_id"]
             upload_url = data["data"]["upload_url"]
 
+        except requests.exceptions.Timeout:
+            return UploadResult(
+                platform="TikTok",
+                status=UploadStatus.FAILED,
+                error="หมดเวลาเชื่อมต่อ TikTok — ตรวจสอบอินเทอร์เน็ต",
+            )
         except Exception as e:
             return UploadResult(
                 platform="TikTok",
                 status=UploadStatus.FAILED,
-                error=f"Init error: {e}",
+                error=f"เริ่มอัปโหลดไม่สำเร็จ: {str(e)[:150]}",
             )
 
         # Step 2: Upload video file
@@ -282,11 +288,17 @@ class TikTokUploader:
                     error=f"Upload failed: HTTP {resp.status_code}",
                 )
 
+        except requests.exceptions.Timeout:
+            return UploadResult(
+                platform="TikTok",
+                status=UploadStatus.FAILED,
+                error="อัปโหลดหมดเวลา — ไฟล์อาจใหญ่เกินไปหรือเน็ตช้า",
+            )
         except Exception as e:
             return UploadResult(
                 platform="TikTok",
                 status=UploadStatus.FAILED,
-                error=f"Upload error: {e}",
+                error=f"อัปโหลดไม่สำเร็จ: {str(e)[:150]}",
             )
 
         # Step 3: Check publish status (poll)
