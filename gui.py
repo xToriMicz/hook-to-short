@@ -322,6 +322,8 @@ class HookToShortApp(ctk.CTk):
             self.upload_privacy_var.set(s["upload_privacy"])
         if "auto_upload" in s:
             self.auto_upload_var.set(s["auto_upload"])
+        if "gemini_only" in s:
+            self.gemini_only_var.set(s["gemini_only"])
 
     def _save_user_settings(self):
         s = load_settings()  # Preserve upload credentials
@@ -335,6 +337,7 @@ class HookToShortApp(ctk.CTk):
             "upload_tags": self.upload_tags_var.get(),
             "upload_privacy": self.upload_privacy_var.get(),
             "auto_upload": self.auto_upload_var.get(),
+            "gemini_only": self.gemini_only_var.get(),
         })
         save_settings(s)
 
@@ -878,6 +881,16 @@ class HookToShortApp(ctk.CTk):
         self.prompt_textbox = ctk.CTkTextbox(tab, height=80, font=self._font(12), wrap="word")
         self.prompt_textbox.pack(fill="x", padx=8, pady=(0, 4))
 
+        # Image generator mode toggle
+        gen_mode_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        gen_mode_frame.pack(fill="x", padx=8, pady=(4, 2))
+
+        self.gemini_only_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(gen_mode_frame, text="ใช้ Gemini เท่านั้น (ข้าม Kie.ai)",
+                        variable=self.gemini_only_var, font=self._font(12)).pack(side="left")
+        ctk.CTkLabel(gen_mode_frame, text="— เลือกเมื่อ Kie.ai เครดิตหมด",
+                     font=self._font(11), text_color="gray").pack(side="left", padx=(6, 0))
+
         # Generate button
         self.generate_btn = ctk.CTkButton(tab, text="สร้างวิดีโอสั้น", width=180, font=self._font(14, "bold"), command=self._on_generate)
         self.generate_btn.pack(pady=(4, 4))
@@ -1059,25 +1072,31 @@ class HookToShortApp(ctk.CTk):
                     os.replace(tmp_hook, hook_path)
 
                 # Step 4: Album art
-                self._gen_step("ขั้น 4/6  สร้างภาพปกด้วย AI (Kie.ai)...")
-                gen = KieAIGenerator()
                 art_filename = f"{song_title.replace(' ', '_')}_art.png"
                 art_path = os.path.join(OUTPUTS_FOLDER, art_filename)
-                image_path = gen.generate_album_art(
-                    song_title=song_title,
-                    mood=mood,
-                    intensity=intensity,
-                    output_path=art_path,
-                    video_style=video_style,
-                    font_style=font_style,
-                    font_angle=font_angle,
-                    artist=artist,
-                    custom_prompt=custom_prompt,
-                )
+                image_path = None
+                gemini_only = self.gemini_only_var.get()
+
+                if not gemini_only:
+                    self._gen_step("ขั้น 4/6  สร้างภาพปกด้วย AI (Kie.ai)...")
+                    gen = KieAIGenerator()
+                    image_path = gen.generate_album_art(
+                        song_title=song_title,
+                        mood=mood,
+                        intensity=intensity,
+                        output_path=art_path,
+                        video_style=video_style,
+                        font_style=font_style,
+                        font_angle=font_angle,
+                        artist=artist,
+                        custom_prompt=custom_prompt,
+                    )
+                    if not image_path:
+                        logger.warning("Kie.ai failed — falling back to Gemini...")
+
                 if not image_path:
-                    # Fallback: try Gemini
-                    logger.warning("Kie.ai failed — falling back to Gemini...")
-                    self._gen_step("ขั้น 4/6  Fallback: สร้างภาพปกด้วย Gemini...")
+                    label = "ขั้น 4/6  สร้างภาพปกด้วย Gemini..." if gemini_only else "ขั้น 4/6  Fallback: สร้างภาพปกด้วย Gemini..."
+                    self._gen_step(label)
                     gemini_gen = GeminiImageGenerator()
                     image_path = gemini_gen.generate_album_art(
                         song_title=song_title,
@@ -1091,7 +1110,8 @@ class HookToShortApp(ctk.CTk):
                         custom_prompt=custom_prompt,
                     )
                 if not image_path:
-                    self.after(0, lambda: self._gen_done(None, "สร้างภาพปกไม่สำเร็จ (Kie.ai + Gemini)"))
+                    fail_src = "Gemini" if gemini_only else "Kie.ai + Gemini"
+                    self.after(0, lambda: self._gen_done(None, f"สร้างภาพปกไม่สำเร็จ ({fail_src})"))
                     return
 
                 # Show image preview
@@ -1354,7 +1374,12 @@ class HookToShortApp(ctk.CTk):
                                          font=self._font(14, "bold"), command=self._on_upload)
         self.upload_btn.pack(pady=(8, 4))
 
-        # Upload progress
+        # Upload progress bar + label
+        self.upload_progress_bar = ctk.CTkProgressBar(tab, width=400, height=14)
+        self.upload_progress_bar.pack(fill="x", padx=8, pady=(8, 2))
+        self.upload_progress_bar.set(0)
+        self.upload_progress_bar.pack_forget()
+
         self.upload_progress = ctk.CTkLabel(tab, text="", font=self._font(13),
                                              wraplength=700, justify="left")
         self.upload_progress.pack(anchor="w", padx=8, pady=(2, 2))
@@ -1362,9 +1387,8 @@ class HookToShortApp(ctk.CTk):
         # Upload results
         self.upload_result_frame = ctk.CTkFrame(tab)
         self.upload_result_frame.pack(fill="x", padx=8, pady=4)
-        self.upload_result_label = ctk.CTkLabel(self.upload_result_frame, text="",
-                                                 justify="left", anchor="w", font=self._font(13))
-        self.upload_result_label.pack(fill="x", padx=8, pady=(6, 2))
+        self._upload_result_rows_frame = ctk.CTkFrame(self.upload_result_frame, fg_color="transparent")
+        self._upload_result_rows_frame.pack(fill="x", padx=8, pady=(6, 2))
         self.upload_retry_btn = ctk.CTkButton(
             self.upload_result_frame, text="ลองอีกครั้ง", width=100, font=self._font(12),
             command=self._on_upload)
@@ -1497,6 +1521,10 @@ class HookToShortApp(ctk.CTk):
     def _get_selected_video_filenames(self) -> list[str]:
         return [fname for var, fname in self._upload_video_checks if var.get()]
 
+    def _upload_progress_callback(self, progress: float):
+        """Called from upload thread with 0.0-1.0 progress."""
+        self.after(0, lambda p=progress: self.upload_progress_bar.set(p))
+
     def _upload_single(self, video_path: str, title: str, description: str,
                        tags: list[str], privacy: str, platforms: list[str],
                        step_prefix: str = "") -> list[UploadResult]:
@@ -1512,10 +1540,13 @@ class HookToShortApp(ctk.CTk):
         total = len(platforms)
         for idx, platform in enumerate(platforms):
             step = f"{step_prefix}({idx + 1}/{total})"
+            # Reset progress bar for each platform
+            self.after(0, lambda: self.upload_progress_bar.set(0))
             if platform == "youtube":
                 self._upload_step(f"{step} YouTube: กำลังอัปโหลด...")
                 yt = YouTubeUploader()
-                result = upload_with_retry(lambda: yt.upload(request))
+                result = upload_with_retry(
+                    lambda: yt.upload(request, progress_callback=self._upload_progress_callback))
                 results.append(result)
             elif platform == "tiktok":
                 self._upload_step(f"{step} TikTok: กำลังอัปโหลด...")
@@ -1572,6 +1603,8 @@ class HookToShortApp(ctk.CTk):
 
         self.upload_btn.configure(state="disabled")
         self.upload_result_frame.pack_forget()
+        self.upload_progress_bar.set(0)
+        self.upload_progress_bar.pack(fill="x", padx=8, pady=(8, 2))
         self.upload_progress.configure(text="เริ่มอัปโหลด...")
         self.status_var.set("กำลังอัปโหลด...")
 
@@ -1606,19 +1639,33 @@ class HookToShortApp(ctk.CTk):
 
     def _upload_done_batch(self, results: list[UploadResult], video_count: int):
         self.upload_btn.configure(state="normal")
+        self.upload_progress_bar.set(1.0)
+        self.upload_progress_bar.pack_forget()
 
-        lines = []
+        # Clear previous result rows
+        for w in self._upload_result_rows_frame.winfo_children():
+            w.destroy()
+
         success_count = 0
         for r in results:
-            icon = "OK" if r.status == UploadStatus.SUCCESS else "FAIL"
+            row = ctk.CTkFrame(self._upload_result_rows_frame, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+
             if r.status == UploadStatus.SUCCESS:
                 success_count += 1
-                line = f"[{icon}] {r.platform}"
+                ctk.CTkLabel(row, text=f"[OK] {r.platform}", font=self._font(12),
+                             text_color="#2ecc71", anchor="w").pack(side="left")
                 if r.url:
-                    line += f"  →  {r.url}"
+                    url = r.url
+                    link_btn = ctk.CTkButton(
+                        row, text=url, width=0, height=22, font=self._font(11),
+                        fg_color="transparent", text_color="#3498db",
+                        hover_color=("gray85", "gray30"), anchor="w",
+                        command=lambda u=url: webbrowser.open(u))
+                    link_btn.pack(side="left", padx=(8, 0))
             else:
-                line = f"[{icon}] {r.platform}  —  {r.error or 'unknown error'}"
-            lines.append(line)
+                ctk.CTkLabel(row, text=f"[FAIL] {r.platform}  —  {r.error or 'unknown error'}",
+                             font=self._font(12), text_color="#e74c3c", anchor="w").pack(side="left")
 
         self._refresh_upload_history()
 
@@ -1627,7 +1674,6 @@ class HookToShortApp(ctk.CTk):
         if video_count > 1:
             summary += f" ({video_count} วิดีโอ)"
         self.upload_progress.configure(text=summary)
-        self.upload_result_label.configure(text="\n".join(lines))
         self.upload_result_frame.pack(fill="x", padx=8, pady=4)
 
         # Show retry button if any failed
