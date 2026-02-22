@@ -17,7 +17,7 @@ hiddenimports = [
     'google.auth', 'google.auth.transport', 'google.auth.transport.requests',
     'google_auth_oauthlib', 'google_auth_oauthlib.flow',
     'googleapiclient', 'googleapiclient.discovery', 'googleapiclient.http',
-    'httplib2',
+    'httplib2', 'google_auth_httplib2',
     # App modules
     'python.mood_detector', 'python.kie_generator', 'python.gemini_generator',
     'python.video_composer', 'python.main',
@@ -42,7 +42,17 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'torch', 'torchaudio', 'torchvision',
+        'pygame', 'pandas', 'matplotlib',
+        'IPython', 'jupyter', 'notebook',
+        'sklearn', 'skimage',
+        'cv2', 'opencv',
+        'flask', 'django',
+        'numba', 'llvmlite',
+        'tensorflow', 'keras',
+        'pyarrow',
+    ],
     noarchive=False,
     optimize=0,
 )

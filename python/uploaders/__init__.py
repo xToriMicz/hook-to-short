@@ -58,6 +58,34 @@ def upload_with_retry(upload_fn: Callable[[], UploadResult],
     return last_result
 
 
+class ProgressFileReader:
+    """Wraps a file object to report read progress via callback.
+
+    Usage with requests:
+        with open(path, "rb") as f:
+            wrapped = ProgressFileReader(f, file_size, callback)
+            requests.put(url, data=wrapped)
+    """
+
+    def __init__(self, file_obj, total_size: int,
+                 callback: Optional[Callable[[float], None]] = None):
+        self._file = file_obj
+        self._total = total_size
+        self._read_so_far = 0
+        self._callback = callback
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._file.read(size)
+        if data:
+            self._read_so_far += len(data)
+            if self._callback and self._total > 0:
+                self._callback(min(self._read_so_far / self._total, 1.0))
+        return data
+
+    def __len__(self) -> int:
+        return self._total
+
+
 def get_output_videos(outputs_folder: str = "./outputs") -> list[dict]:
     """Scan outputs folder for completed .mp4 videos."""
     videos = []

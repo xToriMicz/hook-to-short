@@ -1555,7 +1555,8 @@ class HookToShortApp(ctk.CTk):
                     client_key=s.get("tiktok_client_key", ""),
                     client_secret=s.get("tiktok_client_secret", ""),
                 )
-                result = upload_with_retry(lambda: tt.upload(request))
+                result = upload_with_retry(
+                    lambda: tt.upload(request, progress_callback=self._upload_progress_callback))
                 results.append(result)
             elif platform == "facebook":
                 self._upload_step(f"{step} Facebook: กำลังอัปโหลด...")
@@ -1564,7 +1565,8 @@ class HookToShortApp(ctk.CTk):
                     page_id=s.get("facebook_page_id", ""),
                     access_token=s.get("facebook_access_token", ""),
                 )
-                result = upload_with_retry(lambda: fb.upload(request))
+                result = upload_with_retry(
+                    lambda: fb.upload(request, progress_callback=self._upload_progress_callback))
                 results.append(result)
         return results
 

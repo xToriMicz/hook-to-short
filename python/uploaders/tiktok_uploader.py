@@ -21,7 +21,7 @@ from typing import Optional, Callable
 
 import requests
 
-from . import UploadResult, UploadStatus, UploadRequest
+from . import UploadResult, UploadStatus, UploadRequest, ProgressFileReader
 
 logger = logging.getLogger(__name__)
 
@@ -265,21 +265,17 @@ class TikTokUploader:
                 error=f"เริ่มอัปโหลดไม่สำเร็จ: {str(e)[:150]}",
             )
 
-        # Step 2: Upload video file
+        # Step 2: Upload video file with progress tracking
         try:
-            with open(request.video_path, "rb") as f:
-                video_data = f.read()
-
             upload_headers = {
                 "Content-Type": "video/mp4",
                 "Content-Length": str(file_size),
                 "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
             }
-            resp = requests.put(upload_url, data=video_data,
-                                headers=upload_headers, timeout=300)
-
-            if progress_callback:
-                progress_callback(1.0)
+            with open(request.video_path, "rb") as f:
+                wrapped = ProgressFileReader(f, file_size, progress_callback)
+                resp = requests.put(upload_url, data=wrapped,
+                                    headers=upload_headers, timeout=300)
 
             if resp.status_code not in (200, 201):
                 return UploadResult(

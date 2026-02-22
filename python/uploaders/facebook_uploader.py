@@ -18,7 +18,7 @@ from typing import Optional, Callable
 
 import requests
 
-from . import UploadResult, UploadStatus, UploadRequest
+from . import UploadResult, UploadStatus, UploadRequest, ProgressFileReader
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +110,10 @@ class FacebookUploader:
                 error=f"เริ่มอัปโหลดไม่สำเร็จ: {str(e)[:150]}",
             )
 
-        # Step 2: Upload video file
+        # Step 2: Upload video file with progress tracking
         try:
             with open(request.video_path, "rb") as f:
+                wrapped = ProgressFileReader(f, file_size, progress_callback)
                 upload_resp = requests.post(
                     upload_url,
                     headers={
@@ -120,12 +121,9 @@ class FacebookUploader:
                         "offset": "0",
                         "file_size": str(file_size),
                     },
-                    data=f,
+                    data=wrapped,
                     timeout=300,
                 )
-
-            if progress_callback:
-                progress_callback(1.0)
 
             if upload_resp.status_code != 200:
                 return UploadResult(
