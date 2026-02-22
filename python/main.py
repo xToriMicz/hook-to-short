@@ -76,10 +76,15 @@ def extract_hook(input_file, output_file, clip_length=30):
         chorus_start = find_chorus(chroma, sr, song_length_sec, DETECT_LENGTH)
 
         if chorus_start is None:
-            logger.warning("Could not find clear chorus in audio")
-            return False
-
-        logger.info(f"Chorus found at {chorus_start:.2f}s")
+            # Fallback: pick ~33% into the song (typical first chorus zone)
+            fallback_start = song_length_sec * 0.33
+            # Ensure we have enough room for the clip
+            if fallback_start + clip_length > song_length_sec:
+                fallback_start = max(0, song_length_sec - clip_length)
+            chorus_start = fallback_start
+            logger.warning(f"Could not find clear chorus — using fallback at {chorus_start:.1f}s (33% mark)")
+        else:
+            logger.info(f"Chorus found at {chorus_start:.2f}s")
 
         # Clamp end to song length
         end_sec = min(chorus_start + clip_length, song_length_sec)

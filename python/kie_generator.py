@@ -21,7 +21,7 @@ class KieAIGenerator:
     API_URL = "https://api.kie.ai/api/v1/jobs/createTask"
     MODEL = "nano-banana-pro"
     POLL_URL = "https://api.kie.ai/api/v1/playground/recordInfo"
-    POLL_TIMEOUT = 120  # max seconds to wait
+    POLL_TIMEOUT = 180  # max seconds to wait
 
     def __init__(self, api_key: Optional[str] = None):
         """Initialize with API key from .env or parameter"""

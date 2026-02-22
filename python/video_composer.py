@@ -9,9 +9,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 try:
-    from moviepy.editor import (
-        ImageClip, AudioFileClip, CompositeVideoClip, vfx
-    )
+    from moviepy import ImageClip, AudioFileClip, CompositeVideoClip, vfx
     MOVIEPY_AVAILABLE = True
 except ImportError:
     MOVIEPY_AVAILABLE = False
@@ -84,60 +82,25 @@ class VideoComposer:
             settings = self.PLATFORMS.get(platform, self.PLATFORMS['tiktok'])
             
             # Load audio
-            logger.info(f"📥 Loading audio: {audio_path}")
+            logger.info(f"Loading audio: {audio_path}")
             audio = AudioFileClip(audio_path)
             duration = audio.duration
-            
+
             # Load and resize image to fit platform
-            logger.info(f"📥 Loading image: {image_path}")
-            image = ImageClip(image_path).set_duration(duration)
-            
-            # Resize to platform resolution
+            logger.info(f"Loading image: {image_path}")
             width, height = settings['resolution']
-            image = image.resize(width=width, height=height)
-            
-            # Add fade effects
-            logger.info("✨ Adding fade effects...")
-            fade_duration = 0.5
-            
-            # Fade in
-            def fade_in(get_frame, t):
-                if t < fade_duration:
-                    return get_frame(t) * (t / fade_duration)
-                return get_frame(t)
-            
-            # Fade out
-            def fade_out(get_frame, t):
-                fade_start = duration - fade_duration
-                if t > fade_start:
-                    return get_frame(t) * (1 - (t - fade_start) / fade_duration)
-                return get_frame(t)
-            
-            # Apply both fades
-            image_faded = image.set_make_frame(
-                lambda t: fade_out(
-                    lambda _t: fade_in(image.get_frame, _t),
-                    t
-                )
+            image = (
+                ImageClip(image_path, duration=duration)
+                .resized((width, height))
+                .with_effects([
+                    vfx.FadeIn(0.5),
+                    vfx.FadeOut(0.5),
+                ])
             )
-            
-            # Add optional watermark/title
-            if add_watermark and song_title:
-                logger.info("🏷️  Adding title watermark...")
-                txt = TextClip(
-                    song_title,
-                    fontsize=48,
-                    color='white',
-                    method='caption',
-                    size=(width - 60, None),
-                    font='Arial-Bold'
-                ).set_duration(duration).set_position(('center', height - 100))
-                
-                image_faded = CompositeVideoClip([image_faded, txt])
-            
+
             # Create final video with audio
-            logger.info("🎵 Adding audio...")
-            final_video = image_faded.set_audio(audio)
+            logger.info("Adding audio...")
+            final_video = image.with_audio(audio)
             
             # Export video
             logger.info(f"💾 Exporting video to: {output_path}")
@@ -152,9 +115,7 @@ class VideoComposer:
                 audio_codec='aac',
                 bitrate=settings['bitrate'],
                 audio_bitrate=settings['audio_bitrate'],
-                verbose=False,
-                logger=None,
-                preset='medium'
+                preset='medium',
             )
             
             logger.info(f"✓ Video created: {output_path}")

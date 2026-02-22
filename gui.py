@@ -19,8 +19,12 @@ from typing import Optional
 warnings.filterwarnings("ignore", message="PySoundFile failed")
 warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
 
-# Load .env file
-_env_path = os.path.join(os.path.dirname(__file__), ".env")
+# Load .env file (PyInstaller: look next to the .exe, not in _MEIPASS)
+if getattr(sys, 'frozen', False):
+    _base_dir = os.path.dirname(sys.executable)
+else:
+    _base_dir = os.path.dirname(__file__)
+_env_path = os.path.join(_base_dir, ".env")
 if os.path.exists(_env_path):
     with open(_env_path, encoding="utf-8") as _ef:
         for _line in _ef:
