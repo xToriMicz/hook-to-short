@@ -249,6 +249,229 @@ def _dismiss_overlays(driver):
         pass  # Best effort — don't fail if overlay dismissal fails
 
 
+def _wait_for_video_ready(driver, timeout: int = 120):
+    """Wait for TikTok to finish processing the uploaded video file.
+
+    Polls for indicators that video processing is complete:
+    - Caption editor becomes editable
+    - Upload progress bar disappears or reaches 100%
+    - Post button appears (even if disabled)
+
+    Falls back to a minimum fixed wait if none of the signals are detected.
+    """
+    from selenium.webdriver.common.by import By
+
+    start = time.time()
+    min_wait = 5  # Always wait at least this long
+    poll_interval = 2
+
+    time.sleep(min_wait)
+
+    while time.time() - start < timeout:
+        try:
+            # Check if a progress/processing indicator is still visible
+            processing_indicators = driver.find_elements(By.CSS_SELECTOR, (
+                '[class*="progress"], [class*="uploading"], '
+                '[class*="processing"], [class*="loading"]'
+            ))
+            still_processing = False
+            for el in processing_indicators:
+                text = (el.text or "").lower()
+                if any(w in text for w in ["uploading", "processing", "loading"]):
+                    still_processing = True
+                    break
+                # Check for progress bar that's not at 100%
+                width = el.value_of_css_property("width")
+                if width and "%" in str(width):
+                    still_processing = True
+                    break
+
+            if not still_processing:
+                # Also check for the post button as a readiness signal
+                post_btns = driver.find_elements(
+                    By.CSS_SELECTOR, 'button[data-e2e="post_video_button"]')
+                if post_btns:
+                    logger.info("TikTok: วิดีโอประมวลผลเสร็จแล้ว")
+                    return
+
+            # Check if caption editor is available (another readiness signal)
+            editors = driver.find_elements(
+                By.CSS_SELECTOR, 'div[contenteditable="true"]')
+            if editors and len(editors) > 0:
+                logger.info("TikTok: caption editor พร้อมแล้ว")
+                return
+
+        except Exception:
+            pass
+
+        time.sleep(poll_interval)
+
+    logger.info("TikTok: timeout รอวิดีโอ — ดำเนินการต่อ")
+
+
+def _wait_for_post_ready(driver, timeout: int = 120):
+    """Wait until the Post button is enabled (not disabled/greyed out).
+
+    TikTok disables the Post button while video is still processing.
+    This waits until it becomes clickable.
+    """
+    from selenium.webdriver.common.by import By
+
+    start = time.time()
+    poll_interval = 3
+    time.sleep(3)  # Initial settle
+
+    while time.time() - start < timeout:
+        try:
+            btn = _find_post_button(driver, timeout=5)
+            if btn:
+                # Check if button is enabled
+                is_disabled = btn.get_attribute("disabled")
+                aria_disabled = btn.get_attribute("aria-disabled")
+                classes = btn.get_attribute("class") or ""
+                if (not is_disabled and aria_disabled != "true"
+                        and "disabled" not in classes):
+                    logger.info("TikTok: ปุ่ม Post พร้อมกดแล้ว")
+                    return
+                logger.debug("TikTok: ปุ่ม Post ยัง disabled อยู่ — รอต่อ...")
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+
+    logger.warning("TikTok: timeout รอปุ่ม Post — ลองกดเลย")
+
+
+def _find_post_button(driver, timeout: int = 30):
+    """Find the Post/Publish button using multiple selector strategies.
+
+    Returns the button element or None.
+    """
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.common.by import By
+
+    # Strategy 1: data-e2e attribute (most stable)
+    css_selectors = [
+        'button[data-e2e="post_video_button"]',
+        'button[data-e2e="post-button"]',
+        'button[data-e2e="publish_button"]',
+    ]
+    for selector in css_selectors:
+        try:
+            btn = WebDriverWait(driver, min(timeout, 10)).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+            )
+            if btn:
+                return btn
+        except Exception:
+            continue
+
+    # Strategy 2: XPath text matching (English UI)
+    xpath_selectors = [
+        '//button[contains(text(), "Post")]',
+        '//button[contains(text(), "post")]',
+        '//button[contains(text(), "Publish")]',
+        '//button[contains(text(), "publish")]',
+        '//div[contains(@class, "btn-post")]//button',
+        '//div[contains(@class, "post")]//button',
+    ]
+    for xpath in xpath_selectors:
+        try:
+            btn = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.XPATH, xpath))
+            )
+            if btn:
+                return btn
+        except Exception:
+            continue
+
+    # Strategy 3: JS-based search for button with "Post" text
+    try:
+        btn = driver.execute_script("""
+            var buttons = document.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {
+                var text = (buttons[i].textContent || '').trim().toLowerCase();
+                if (text === 'post' || text === 'publish') {
+                    return buttons[i];
+                }
+            }
+            return null;
+        """)
+        if btn:
+            return btn
+    except Exception:
+        pass
+
+    return None
+
+
+def _wait_for_upload_success(driver, timeout: int = 60) -> bool:
+    """Wait for TikTok to confirm the upload was successful.
+
+    Checks multiple signals: success text, URL change, "upload another" button.
+    Returns True if success was detected, False otherwise.
+    """
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.common.by import By
+
+    success_xpaths = [
+        '//*[contains(text(), "uploaded")]',
+        '//*[contains(text(), "Your video is being uploaded")]',
+        '//*[contains(text(), "being processed")]',
+        '//*[contains(text(), "successfully")]',
+        '//*[contains(text(), "Manage your posts")]',
+        '//*[contains(text(), "Upload another")]',
+        '//*[contains(text(), "upload another")]',
+        '//*[contains(text(), "Your video has been")]',
+        '//*[contains(text(), "video is live")]',
+    ]
+
+    start = time.time()
+    poll_interval = 3
+
+    while time.time() - start < timeout:
+        # Check text-based signals
+        for xpath in success_xpaths:
+            try:
+                elements = driver.find_elements(By.XPATH, xpath)
+                if elements:
+                    logger.info("TikTok: ตรวจพบข้อความสำเร็จ")
+                    return True
+            except Exception:
+                continue
+
+        # Check URL change (redirect away from upload page = likely success)
+        try:
+            current_url = driver.current_url
+            if "/upload" not in current_url and "tiktok.com" in current_url:
+                logger.info("TikTok: redirect จากหน้า upload — น่าจะสำเร็จ")
+                return True
+        except Exception:
+            pass
+
+        # Check via JS for any success-related elements
+        try:
+            found = driver.execute_script("""
+                var body = document.body.innerText.toLowerCase();
+                var signals = ['uploaded', 'manage your posts', 'upload another',
+                               'successfully', 'video is live', 'being processed'];
+                for (var i = 0; i < signals.length; i++) {
+                    if (body.indexOf(signals[i]) !== -1) return true;
+                }
+                return false;
+            """)
+            if found:
+                logger.info("TikTok: JS ตรวจพบสัญญาณสำเร็จ")
+                return True
+        except Exception:
+            pass
+
+        time.sleep(poll_interval)
+
+    logger.warning("TikTok: ไม่พบสัญญาณสำเร็จชัดเจน — ถือว่าสำเร็จ (best-effort)")
+    return False
+
+
 class TikTokBrowserUploader:
     """Upload videos to TikTok via browser automation (Selenium + Edge)."""
 
@@ -354,7 +577,11 @@ class TikTokBrowserUploader:
 
             # Step 2: Navigate to upload page
             driver.get(TIKTOK_UPLOAD_URL)
-            time.sleep(3)
+            # Wait for page to be interactive (not just loaded)
+            WebDriverWait(driver, 15).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(2)
 
             # Step 3: Check if still logged in (redirected to login = session expired)
             if "/login" in driver.current_url:
@@ -392,11 +619,13 @@ class TikTokBrowserUploader:
 
             # Step 5: Wait for video processing (TikTok needs time to process)
             logger.info("TikTok: รอประมวลผลวิดีโอ...")
-            time.sleep(10)
+            # Smart wait: poll for caption editor to become available (signals processing done)
+            # Falls back to fixed wait if editor not found within timeout
+            _wait_for_video_ready(driver, timeout=UPLOAD_TIMEOUT)
 
             # Dismiss overlays again (TikTok may show tutorial after file select)
             _dismiss_overlays(driver)
-            time.sleep(2)
+            time.sleep(1)
 
             if progress_callback:
                 progress_callback(0.5)
@@ -409,21 +638,29 @@ class TikTokBrowserUploader:
                 caption += "\n" + " ".join(f"#{t}" for t in request.tags)
 
             try:
-                # TikTok's caption editor — DraftEditor contenteditable div
+                # TikTok's caption editor — DraftEditor or newer editor
+                # Multiple selectors for resilience against UI changes
                 caption_selectors = [
+                    # DraftEditor (classic)
                     'div.DraftEditor-root div[contenteditable="true"]',
                     'div[contenteditable="true"][data-text="true"]',
                     'div[aria-autocomplete="list"][contenteditable="true"]',
+                    # Newer TikTok editor variants
+                    'div[data-e2e="caption-editor"] div[contenteditable="true"]',
+                    'div[class*="caption"] div[contenteditable="true"]',
+                    'div[class*="editor"] div[contenteditable="true"]',
+                    # Broadest fallback
                     'div[contenteditable="true"]',
                 ]
 
                 caption_input = None
                 for selector in caption_selectors:
                     try:
-                        caption_input = WebDriverWait(driver, 15).until(
+                        caption_input = WebDriverWait(driver, 8).until(
                             EC.presence_of_element_located((By.CSS_SELECTOR, selector))
                         )
                         if caption_input:
+                            logger.debug(f"TikTok: caption editor found with: {selector}")
                             break
                     except Exception:
                         continue
@@ -445,45 +682,14 @@ class TikTokBrowserUploader:
 
             # Step 7: Wait for upload/processing to finish before clicking post
             logger.info("TikTok: รอก่อนกด Post...")
-            time.sleep(8)
+            _wait_for_post_ready(driver, timeout=UPLOAD_TIMEOUT)
 
             # Dismiss overlays one more time before clicking Post
             _dismiss_overlays(driver)
 
             # Step 8: Click Post/Publish button
             try:
-                post_btn = None
-
-                # Try CSS selectors
-                css_selectors = [
-                    'button[data-e2e="post_video_button"]',
-                ]
-                for selector in css_selectors:
-                    try:
-                        post_btn = WebDriverWait(driver, UPLOAD_TIMEOUT).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                        )
-                        if post_btn:
-                            break
-                    except Exception:
-                        continue
-
-                # Try XPath if CSS didn't work
-                if not post_btn:
-                    xpath_selectors = [
-                        '//button[contains(text(), "Post")]',
-                        '//button[contains(text(), "post")]',
-                        '//div[contains(@class, "btn-post")]//button',
-                    ]
-                    for xpath in xpath_selectors:
-                        try:
-                            post_btn = WebDriverWait(driver, 10).until(
-                                EC.presence_of_element_located((By.XPATH, xpath))
-                            )
-                            if post_btn:
-                                break
-                        except Exception:
-                            continue
+                post_btn = _find_post_button(driver, timeout=30)
 
                 if post_btn:
                     # Use JS click to bypass any overlay
@@ -540,35 +746,7 @@ class TikTokBrowserUploader:
                 progress_callback(0.9)
 
             # Step 9: Wait for success confirmation
-            try:
-                success_xpaths = [
-                    '//*[contains(text(), "uploaded")]',
-                    '//*[contains(text(), "Your video is being uploaded")]',
-                    '//*[contains(text(), "being processed")]',
-                    '//*[contains(text(), "successfully")]',
-                    '//*[contains(text(), "Manage your posts")]',
-                    '//*[contains(text(), "Upload another")]',
-                ]
-
-                success_found = False
-                for xpath in success_xpaths:
-                    try:
-                        WebDriverWait(driver, PUBLISH_TIMEOUT).until(
-                            EC.presence_of_element_located((By.XPATH, xpath))
-                        )
-                        success_found = True
-                        break
-                    except Exception:
-                        continue
-
-                if not success_found:
-                    # Check URL change as fallback
-                    time.sleep(10)
-                    if "/upload" not in driver.current_url:
-                        success_found = True
-
-            except Exception:
-                pass  # Best-effort check
+            success_found = _wait_for_upload_success(driver, timeout=PUBLISH_TIMEOUT)
 
             # Step 10: Save updated cookies
             _save_cookies(driver, self.cookie_path)
