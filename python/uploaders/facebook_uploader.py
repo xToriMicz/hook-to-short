@@ -1,14 +1,15 @@
 """
 Facebook Reels Uploader — Graph API
-อัปโหลดวิดีโอสั้นไปยัง Facebook Page เป็น Reels ผ่าน Graph API
+อัปโหลดวิดีโอสั้นไปยัง Facebook เป็น Reels ผ่าน Graph API
 
 Setup:
 1. ไปที่ developers.facebook.com → สร้าง App
 2. เพิ่ม Facebook Login product
-3. สร้าง Page Access Token (ใน Graph API Explorer)
-   - permissions: pages_manage_posts, pages_read_engagement, publish_video
+3. สร้าง Access Token (ใน Graph API Explorer)
+   - permissions: publish_video (+ pages_manage_posts ถ้าโพสต์ลง Page)
 4. แปลงเป็น Long-Lived Token (หมดอายุ 60 วัน)
-5. คัดลอก Page ID + Access Token มาใส่ในตั้งค่า
+5. คัดลอก Access Token มาใส่ในตั้งค่า
+   - Page ID เป็น optional (ถ้าไม่ใส่จะใช้ "me" = โปรไฟล์ส่วนตัว)
 """
 
 import os
@@ -27,14 +28,14 @@ GRAPH_API_BASE = "https://graph.facebook.com/v21.0"
 
 class FacebookUploader:
     def __init__(self, page_id: str = "", access_token: str = ""):
-        self.page_id = page_id
+        self.page_id = page_id.strip() or "me"
         self.access_token = access_token
 
     def is_configured(self) -> bool:
-        return bool(self.page_id and self.access_token)
+        return bool(self.access_token)
 
     def is_authenticated(self) -> bool:
-        """Verify token is valid by checking page info."""
+        """Verify token is valid by checking account info."""
         if not self.is_configured():
             return False
         try:
@@ -54,7 +55,7 @@ class FacebookUploader:
             return UploadResult(
                 platform="Facebook",
                 status=UploadStatus.FAILED,
-                error="ยังไม่ได้ตั้งค่า Page ID / Access Token",
+                error="ยังไม่ได้ตั้งค่า Access Token",
             )
 
         if not os.path.exists(request.video_path):

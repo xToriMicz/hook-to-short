@@ -37,10 +37,12 @@ settings.json
 client_secrets.json
 youtube_token.json
 tiktok_token.json
+tiktok_cookies.json
 .env
 
 # Runtime data
 upload_history.json
+gui_error.log
 
 # OS
 Thumbs.db
