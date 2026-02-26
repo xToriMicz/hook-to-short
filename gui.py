@@ -9,6 +9,7 @@ import json
 import logging
 import subprocess
 import re
+from urllib.parse import urlparse, parse_qs
 import threading
 import time
 import warnings
@@ -439,15 +440,15 @@ class HookToShortApp(ctk.CTk):
         self.dl_result_frame.pack_forget()
 
         # --- Channel Scanner ---
-        sep_label = ctk.CTkLabel(tab, text="── หรือ ดาวน์โหลดทั้งช่อง ──", font=self._font(13),
+        sep_label = ctk.CTkLabel(tab, text="── สแกน ช่อง / Playlist / Releases ──", font=self._font(13),
                                   text_color="gray")
         sep_label.pack(pady=(12, 4))
 
         ch_frame = ctk.CTkFrame(tab, fg_color="transparent")
         ch_frame.pack(fill="x", padx=8, pady=(0, 4))
 
-        ctk.CTkLabel(ch_frame, text="ลิงก์ช่อง:", font=self._font(13)).pack(side="left", padx=(0, 6))
-        self.channel_url_entry = ctk.CTkEntry(ch_frame, placeholder_text="วางลิงก์ช่อง YouTube ที่นี่...",
+        ctk.CTkLabel(ch_frame, text="ลิงก์สแกน:", font=self._font(13)).pack(side="left", padx=(0, 6))
+        self.channel_url_entry = ctk.CTkEntry(ch_frame, placeholder_text="วางลิงก์ช่อง / playlist / releases ...",
                                                width=400, font=self._font(13))
         self.channel_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
@@ -488,6 +489,11 @@ class HookToShortApp(ctk.CTk):
         if not url:
             self.dl_progress.configure(text="กรุณาใส่ลิงก์ YouTube")
             return
+
+        # Warn if URL contains a playlist param
+        if 'list=' in url:
+            self.dl_progress.configure(
+                text="ลิงก์นี้มี playlist — ถ้าต้องการโหลดทั้ง playlist ให้ใช้สแกนด้านล่าง")
 
         self.download_btn.configure(state="disabled")
         self.dl_result_frame.pack_forget()
@@ -592,15 +598,68 @@ class HookToShortApp(ctk.CTk):
             name = name[:max_length]
         return name.strip('_') or "untitled"
 
+    @staticmethod
+    def _classify_url(url: str):
+        """Classify a YouTube URL into (type, clean_url).
+
+        Returns one of:
+        - ("video", url)     — single video, no playlist
+        - ("playlist", url)  — playlist or watch?v=...&list=...
+        - ("releases", url)  — channel releases tab
+        - ("channel", url)   — channel (appends /videos if needed)
+        """
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        path = parsed.path.rstrip('/')
+
+        # Playlist page: /playlist?list=...
+        if path == '/playlist' and 'list' in qs:
+            return ("playlist", url)
+
+        # Watch page
+        if '/watch' in path and 'v' in qs:
+            if 'list' in qs:
+                return ("playlist", url)
+            return ("video", url)
+
+        # Channel with /releases tab
+        if re.search(r'/@[^/]+/releases$', path):
+            return ("releases", url)
+
+        # Channel already has /videos
+        if re.search(r'/@[^/]+/videos$', path):
+            return ("channel", url)
+        if re.search(r'/(c/[^/]+|channel/[^/]+)/videos$', path):
+            return ("channel", url)
+
+        # Bare channel — append /videos
+        if re.search(r'/@[^/]+$', path) or re.search(r'/(c|channel)/[^/]+$', path):
+            return ("channel", url.rstrip('/') + '/videos')
+
+        # Fallback: treat as channel, append /videos
+        return ("channel", url.rstrip('/') + '/videos')
+
     def _on_scan_channel(self):
         channel_url = self.channel_url_entry.get().strip()
         if not channel_url:
-            self.batch_progress.configure(text="กรุณาใส่ลิงก์ช่อง YouTube")
+            self.batch_progress.configure(text="กรุณาใส่ลิงก์ช่อง / playlist / releases")
             return
 
-        # Auto-append /videos to only scan the videos tab
-        if not channel_url.rstrip('/').endswith('/videos'):
-            channel_url = channel_url.rstrip('/') + '/videos'
+        # Classify the URL
+        url_type, channel_url = self._classify_url(channel_url)
+
+        # Single video — redirect user to the download field
+        if url_type == "video":
+            self.batch_progress.configure(
+                text="ลิงก์นี้เป็นวิดีโอเดี่ยว ใช้ช่องดาวน์โหลดด้านบนแทน")
+            return
+
+        type_labels = {
+            "playlist": "Playlist",
+            "releases": "Releases",
+            "channel": "Channel",
+        }
+        type_label = type_labels.get(url_type, url_type)
 
         # Parse scan limit
         try:
@@ -609,8 +668,8 @@ class HookToShortApp(ctk.CTk):
             limit = 50
 
         self.scan_btn.configure(state="disabled")
-        self.batch_progress.configure(text=f"กำลังสแกนช่อง (สูงสุด {limit} คลิป)...")
-        self.status_var.set("กำลังสแกนช่อง...")
+        self.batch_progress.configure(text=f"กำลังสแกน {type_label} (สูงสุด {limit} คลิป)...")
+        self.status_var.set(f"กำลังสแกน {type_label}...")
 
         def task():
             try:
