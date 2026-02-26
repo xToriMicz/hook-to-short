@@ -255,6 +255,87 @@ def validate_custom_schedule(date_str: str, time_str: str):
     return dt
 
 
+# ---------------------------------------------------------------------------
+# Hook preview helpers (mirrors gui.py hook preview logic)
+# ---------------------------------------------------------------------------
+
+def get_hook_filename(song_title: str, hook_length: int, manual_start: float = None) -> str:
+    """Mirror hook filename generation from _on_preview_hook()."""
+    safe_title = song_title.replace(' ', '_')
+    if manual_start is not None:
+        return f"{safe_title}_hook_{hook_length}s_at{int(manual_start)}s.wav"
+    return f"{safe_title}_hook_{hook_length}s.wav"
+
+
+def validate_hook_start(start_str: str, song_length: float):
+    """Mirror manual start validation from _on_preview_hook().
+
+    Returns float on success, raises ValueError on failure.
+    """
+    if not start_str:
+        raise ValueError("ค่าว่าง")
+    start_sec = float(start_str)
+    if start_sec < 0:
+        raise ValueError("ค่าต้องมากกว่า 0")
+    if start_sec >= song_length:
+        raise ValueError(f"ตำแหน่งเกินความยาวเพลง ({song_length:.0f} วินาที)")
+    return start_sec
+
+
+def should_reuse_preview(preview_path: str, hook_length: int) -> bool:
+    """Mirror preview reuse logic from _on_generate()."""
+    if not preview_path:
+        return False
+    import os
+    basename = os.path.basename(preview_path)
+    return str(hook_length) in basename
+
+
+HOOK_FILENAME_TESTS = [
+    # (song_title, hook_length, manual_start, expected, label)
+    ("My Song", 30, None,
+     "My_Song_hook_30s.wav",
+     "auto-detect -> standard filename"),
+    ("My Song", 20, None,
+     "My_Song_hook_20s.wav",
+     "different length -> different filename"),
+    ("My Song", 30, 45.0,
+     "My_Song_hook_30s_at45s.wav",
+     "manual start -> includes position"),
+    ("My Song", 30, 0.0,
+     "My_Song_hook_30s_at0s.wav",
+     "manual start at 0 -> at0s"),
+    ("เพลงไทย Test", 25, None,
+     "เพลงไทย_Test_hook_25s.wav",
+     "Thai title -> spaces replaced"),
+    ("Song A", 30, 120.0,
+     "Song_A_hook_30s_at120s.wav",
+     "manual start 120s -> at120s"),
+]
+
+HOOK_START_TESTS = [
+    # (start_str, song_length, should_pass, label)
+    ("30", 180.0, True, "30s in 180s song -> OK"),
+    ("0", 180.0, True, "0s start -> OK"),
+    ("179", 180.0, True, "near end -> OK"),
+    ("180", 180.0, False, "at song length -> error"),
+    ("200", 180.0, False, "beyond song length -> error"),
+    ("-5", 180.0, False, "negative start -> error"),
+    ("abc", 180.0, False, "non-numeric -> error"),
+    ("", 180.0, False, "empty string -> error"),
+]
+
+HOOK_REUSE_TESTS = [
+    # (preview_path, hook_length, expected_reuse, label)
+    ("outputs/My_Song_hook_30s.wav", 30, True, "matching 30s -> reuse"),
+    ("outputs/My_Song_hook_30s.wav", 20, False, "length mismatch 30 vs 20 -> no reuse"),
+    ("outputs/My_Song_hook_30s_at45s.wav", 30, True, "manual start with matching length -> reuse"),
+    (None, 30, False, "no preview -> no reuse"),
+    ("", 30, False, "empty path -> no reuse"),
+    ("outputs/My_Song_hook_20s.wav", 20, True, "matching 20s -> reuse"),
+]
+
+
 BATCH_RESULT_TESTS = [
     # (success, total, failed_count, expected_text, label)
     (10, 10, 0,
@@ -407,6 +488,54 @@ def run_tests():
             failed += 1
             print(f"  FAIL  {label}")
             print(f"        Expected: {expected_color}")
+            print(f"        Got:      {actual}")
+
+    print(f"\n=== Hook Preview Filename Tests ===\n")
+    for song, length, manual_start, expected, label in HOOK_FILENAME_TESTS:
+        actual = get_hook_filename(song, length, manual_start)
+        ok = actual == expected
+        if ok:
+            passed += 1
+            print(f"  PASS  {label}")
+        else:
+            failed += 1
+            print(f"  FAIL  {label}")
+            print(f"        Expected: {expected}")
+            print(f"        Got:      {actual}")
+
+    print(f"\n=== Hook Start Validation Tests ===\n")
+    for start_str, song_length, should_pass, label in HOOK_START_TESTS:
+        try:
+            validate_hook_start(start_str, song_length)
+            ok = should_pass
+            if ok:
+                passed += 1
+                print(f"  PASS  {label}")
+            else:
+                failed += 1
+                print(f"  FAIL  {label}")
+                print(f"        Expected error but got success")
+        except ValueError as e:
+            ok = not should_pass
+            if ok:
+                passed += 1
+                print(f"  PASS  {label} (error: {e})")
+            else:
+                failed += 1
+                print(f"  FAIL  {label}")
+                print(f"        Expected success but got: {e}")
+
+    print(f"\n=== Hook Preview Reuse Tests ===\n")
+    for preview_path, hook_length, expected_reuse, label in HOOK_REUSE_TESTS:
+        actual = should_reuse_preview(preview_path, hook_length)
+        ok = actual == expected_reuse
+        if ok:
+            passed += 1
+            print(f"  PASS  {label}")
+        else:
+            failed += 1
+            print(f"  FAIL  {label}")
+            print(f"        Expected: {expected_reuse}")
             print(f"        Got:      {actual}")
 
     print(f"\n=== Custom Schedule Validation Tests ===\n")

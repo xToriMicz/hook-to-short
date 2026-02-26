@@ -295,6 +295,7 @@ class HookToShortApp(ctk.CTk):
         self.tab_settings = self.tabview.add("ตั้งค่า")
 
         self.auto_upload_var = ctk.BooleanVar(value=False)
+        self._preview_hook_process = None
 
         self._build_download_tab()
         self._build_library_tab()
@@ -408,6 +409,7 @@ class HookToShortApp(ctk.CTk):
         save_settings(s)
 
     def _on_close(self):
+        self._stop_hook_preview()
         self._save_user_settings()
         self.destroy()
 
@@ -1093,6 +1095,21 @@ class HookToShortApp(ctk.CTk):
         self.hook_length_label.pack(side="left", padx=(0, 12))
         self.hook_length_var.trace_add("write", lambda *_: self.hook_length_label.configure(text=f"{self.hook_length_var.get()} วิ."))
 
+        # Hook preview button (inline with options row)
+        self.preview_hook_btn = ctk.CTkButton(
+            opts_frame, text="ฟังท่อนฮุก", width=100, font=self._font(12),
+            fg_color="#8e44ad", hover_color="#9b59b6",
+            command=self._on_preview_hook)
+        self.preview_hook_btn.pack(side="left", padx=(0, 4))
+
+        self.stop_hook_btn = ctk.CTkButton(
+            opts_frame, text="หยุด", width=50, font=self._font(12),
+            fg_color="#e74c3c", hover_color="#c0392b",
+            command=self._stop_hook_preview)
+        # Hidden until playing
+        self.stop_hook_btn.pack(side="left", padx=(0, 12))
+        self.stop_hook_btn.pack_forget()
+
         ctk.CTkLabel(opts_frame, text="สไตล์ MV:", font=self._font(13)).pack(side="left", padx=(0, 4))
         self.style_var = ctk.StringVar(value="Thai")
         self.style_dropdown = ctk.CTkComboBox(opts_frame, variable=self.style_var,
@@ -1108,6 +1125,35 @@ class HookToShortApp(ctk.CTk):
                                                   values=["TikTok", "Reels", "YouTube Shorts"],
                                                   width=140, state="readonly", font=self._font(13))
         self.platform_dropdown.pack(side="left")
+
+        # Hook preview info row
+        hook_info_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        hook_info_frame.pack(fill="x", padx=8, pady=(0, 2))
+        hook_info_frame.pack_forget()
+        self._hook_info_frame = hook_info_frame
+
+        ctk.CTkLabel(hook_info_frame, text="เริ่มที่ (วินาที):", font=self._font(12)).pack(side="left")
+        self.hook_start_var = ctk.StringVar(value="")
+        self.hook_start_entry = ctk.CTkEntry(
+            hook_info_frame, textvariable=self.hook_start_var,
+            width=60, font=self._font(12), placeholder_text="อัตโนมัติ")
+        self.hook_start_entry.pack(side="left", padx=(4, 8))
+
+        self.hook_preview_status = ctk.CTkLabel(
+            hook_info_frame, text="", font=self._font(11), text_color="#3498db")
+        self.hook_preview_status.pack(side="left", fill="x", expand=True)
+
+        self.hook_use_btn = ctk.CTkButton(
+            hook_info_frame, text="ลองท่อนอื่น", width=90, font=self._font(11),
+            fg_color="#7f8c8d", hover_color="#95a5a6",
+            command=self._on_retry_hook)
+        self.hook_use_btn.pack(side="right")
+        self.hook_use_btn.pack_forget()
+
+        # Hook preview state
+        self._preview_hook_path = None
+        self._preview_hook_process = None
+        self._preview_hook_start = None  # detected chorus start position
 
         # Font style row
         font_frame = ctk.CTkFrame(tab, fg_color="transparent")
@@ -1243,6 +1289,178 @@ class HookToShortApp(ctk.CTk):
         except Exception as e:
             logger.warning(f"Could not show preview: {e}")
 
+    # -----------------------------------------------------------------------
+    # Hook Preview
+    # -----------------------------------------------------------------------
+
+    def _on_preview_hook(self):
+        """Extract hook and play it for the user to hear."""
+        track = self._selected_track()
+        if not track:
+            self.gen_progress.configure(text="กรุณาเลือกเพลงก่อน")
+            return
+
+        audio_path = track["file_path"]
+        if not os.path.exists(audio_path):
+            self.gen_progress.configure(text=f"ไม่พบไฟล์เพลง: {audio_path}")
+            return
+
+        # Stop any current playback
+        self._stop_hook_preview()
+
+        hook_length = self.hook_length_var.get()
+        manual_start = self.hook_start_var.get().strip()
+
+        self.preview_hook_btn.configure(state="disabled")
+        self._hook_info_frame.pack(fill="x", padx=8, pady=(0, 2))
+        self.hook_preview_status.configure(text="กำลังตัดท่อนฮุก...", text_color="#f39c12")
+        self.hook_use_btn.pack_forget()
+
+        def task():
+            try:
+                from python.main import extract_hook as _extract_hook
+
+                filename = Path(audio_path).stem
+                metadata = extract_metadata_from_title(filename)
+                song_title = metadata["song"]
+
+                # Build hook path — include manual start in name if provided
+                if manual_start:
+                    try:
+                        start_sec = float(manual_start)
+                        if start_sec < 0:
+                            raise ValueError("ค่าต้องมากกว่า 0")
+                    except ValueError as e:
+                        self.after(0, lambda: self._hook_preview_done(
+                            None, f"เริ่มที่ไม่ถูกต้อง: {e}"))
+                        return
+                    hook_filename = f"{song_title.replace(' ', '_')}_hook_{hook_length}s_at{int(start_sec)}s.wav"
+                else:
+                    start_sec = None
+                    hook_filename = f"{song_title.replace(' ', '_')}_hook_{hook_length}s.wav"
+
+                hook_path = os.path.join(OUTPUTS_FOLDER, hook_filename)
+
+                if os.path.exists(hook_path):
+                    logger.info(f"Hook cache hit: {hook_path}")
+                else:
+                    if start_sec is not None:
+                        # Manual start: cut directly with soundfile
+                        self.after(0, lambda s=start_sec: self.hook_preview_status.configure(
+                            text=f"ตัดจากตำแหน่ง {s:.0f} วินาที...", text_color="#f39c12"))
+                        import soundfile as sf
+                        from pychorus.helpers import create_chroma
+                        chroma, song_wav_data, sr, song_length_sec = create_chroma(audio_path)
+                        end_sec = min(start_sec + hook_length, song_length_sec)
+                        if start_sec >= song_length_sec:
+                            self.after(0, lambda: self._hook_preview_done(
+                                None, f"ตำแหน่งเกินความยาวเพลง ({song_length_sec:.0f} วินาที)"))
+                            return
+                        chorus_data = song_wav_data[int(start_sec * sr):int(end_sec * sr)]
+                        sf.write(hook_path, chorus_data, sr)
+                        actual_length = end_sec - start_sec
+                        logger.info(f"Manual hook: {actual_length:.1f}s from {start_sec:.1f}s")
+                        self._preview_hook_start = start_sec
+                    else:
+                        # Auto-detect chorus
+                        from pychorus.helpers import create_chroma, find_chorus
+                        import soundfile as sf
+                        chroma, song_wav_data, sr, song_length_sec = create_chroma(audio_path)
+                        DETECT_LENGTH = 15
+                        chorus_start = find_chorus(chroma, sr, song_length_sec, DETECT_LENGTH)
+                        if chorus_start is None:
+                            chorus_start = song_length_sec * 0.33
+                            if chorus_start + hook_length > song_length_sec:
+                                chorus_start = max(0, song_length_sec - hook_length)
+                            logger.warning(f"Could not find chorus — fallback at {chorus_start:.1f}s")
+                        else:
+                            logger.info(f"Chorus found at {chorus_start:.2f}s")
+                        end_sec = min(chorus_start + hook_length, song_length_sec)
+                        chorus_data = song_wav_data[int(chorus_start * sr):int(end_sec * sr)]
+                        sf.write(hook_path, chorus_data, sr)
+                        self._preview_hook_start = chorus_start
+
+                self._preview_hook_path = hook_path
+                self.after(0, lambda: self._play_hook(hook_path))
+
+            except Exception as e:
+                logger.error(f"Hook preview error: {e}")
+                self.after(0, lambda: self._hook_preview_done(None, str(e)))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _play_hook(self, hook_path: str):
+        """Play a hook WAV file using ffplay."""
+        self.hook_preview_status.configure(text="กำลังเล่น...", text_color="#2ecc71")
+        self.stop_hook_btn.pack(side="left", padx=(0, 12), before=self.preview_hook_btn)
+        self.preview_hook_btn.configure(state="normal")
+
+        def play_task():
+            try:
+                proc = subprocess.Popen(
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", hook_path],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._preview_hook_process = proc
+                proc.wait()
+                # Playback finished naturally
+                if self._preview_hook_process is proc:
+                    self._preview_hook_process = None
+                    start_info = ""
+                    if self._preview_hook_start is not None:
+                        start_info = f" (เริ่มที่ {self._preview_hook_start:.1f} วินาที)"
+                    self.after(0, lambda: self._hook_preview_done(
+                        self._preview_hook_path,
+                        None,
+                        f"เล่นจบแล้ว — {self.hook_length_var.get()} วิ.{start_info}"))
+            except FileNotFoundError:
+                self.after(0, lambda: self._hook_preview_done(
+                    None, "ไม่พบ ffplay — ต้องติดตั้ง ffmpeg"))
+            except Exception as e:
+                self.after(0, lambda: self._hook_preview_done(None, str(e)))
+
+        threading.Thread(target=play_task, daemon=True).start()
+
+    def _stop_hook_preview(self):
+        """Stop hook playback if running."""
+        if self._preview_hook_process:
+            try:
+                self._preview_hook_process.terminate()
+            except OSError:
+                pass
+            self._preview_hook_process = None
+        if hasattr(self, "stop_hook_btn"):
+            self.stop_hook_btn.pack_forget()
+
+    def _hook_preview_done(self, hook_path: Optional[str], error: Optional[str],
+                           info: Optional[str] = None):
+        """Called when hook preview finishes (success or error)."""
+        self.preview_hook_btn.configure(state="normal")
+        self.stop_hook_btn.pack_forget()
+
+        if error:
+            self.hook_preview_status.configure(text=f"ผิดพลาด: {error}", text_color="#e74c3c")
+            self.hook_use_btn.pack_forget()
+            self._preview_hook_path = None
+        else:
+            text = info or "พร้อมใช้งาน"
+            self.hook_preview_status.configure(text=text, text_color="#2ecc71")
+            self.hook_use_btn.pack(side="right")
+
+    def _on_retry_hook(self):
+        """Clear cached hook and re-extract with different detection."""
+        if self._preview_hook_path and os.path.exists(self._preview_hook_path):
+            try:
+                os.remove(self._preview_hook_path)
+                logger.info(f"Removed hook for retry: {os.path.basename(self._preview_hook_path)}")
+            except OSError:
+                pass
+        self._preview_hook_path = None
+        self._preview_hook_start = None
+        self._on_preview_hook()
+
     def _on_preview_prompt(self):
         """Build image prompt from current settings and show in textbox."""
         track = self._selected_track()
@@ -1329,25 +1547,33 @@ class HookToShortApp(ctk.CTk):
                 mood = mood_info["mood"]
                 intensity = mood_info["intensity"]
 
-                # Step 3: Hook extraction (use ASCII temp path to avoid Thai encoding issues)
-                # Check cache — include length in filename so different lengths get separate files
-                hook_filename = f"{song_title.replace(' ', '_')}_hook_{hook_length}s.wav"
-                hook_path = os.path.join(OUTPUTS_FOLDER, hook_filename)
-
-                if os.path.exists(hook_path):
-                    self._gen_step("ขั้น 3/6  ใช้ท่อนฮุกจาก cache...")
-                    logger.info(f"Hook cache hit: {hook_path}")
+                # Step 3: Hook extraction
+                # Reuse hook from preview if available and matching length
+                if (self._preview_hook_path
+                        and os.path.exists(self._preview_hook_path)
+                        and str(hook_length) in os.path.basename(self._preview_hook_path)):
+                    hook_path = self._preview_hook_path
+                    self._gen_step("ขั้น 3/6  ใช้ท่อนฮุกจาก preview...")
+                    logger.info(f"Using previewed hook: {hook_path}")
                 else:
-                    self._gen_step("ขั้น 3/6  ตัดท่อนฮุก (อาจใช้เวลาสักครู่)...")
-                    tmp_hook = os.path.join(OUTPUTS_FOLDER, f"_tmp_hook_{int(datetime.now().timestamp())}.wav")
-                    from python.main import extract_hook as _extract_hook
-                    if not _extract_hook(audio_path, tmp_hook, hook_length):
-                        if os.path.exists(tmp_hook):
-                            os.remove(tmp_hook)
-                        self.after(0, lambda: self._gen_done(None, "ตัดท่อนฮุกไม่สำเร็จ — อาจไม่พบท่อน chorus"))
-                        return
-                    # Rename temp to final path
-                    os.replace(tmp_hook, hook_path)
+                    # Check cache — include length in filename
+                    hook_filename = f"{song_title.replace(' ', '_')}_hook_{hook_length}s.wav"
+                    hook_path = os.path.join(OUTPUTS_FOLDER, hook_filename)
+
+                    if os.path.exists(hook_path):
+                        self._gen_step("ขั้น 3/6  ใช้ท่อนฮุกจาก cache...")
+                        logger.info(f"Hook cache hit: {hook_path}")
+                    else:
+                        self._gen_step("ขั้น 3/6  ตัดท่อนฮุก (อาจใช้เวลาสักครู่)...")
+                        tmp_hook = os.path.join(OUTPUTS_FOLDER, f"_tmp_hook_{int(datetime.now().timestamp())}.wav")
+                        from python.main import extract_hook as _extract_hook
+                        if not _extract_hook(audio_path, tmp_hook, hook_length):
+                            if os.path.exists(tmp_hook):
+                                os.remove(tmp_hook)
+                            self.after(0, lambda: self._gen_done(None, "ตัดท่อนฮุกไม่สำเร็จ — อาจไม่พบท่อน chorus"))
+                            return
+                        # Rename temp to final path
+                        os.replace(tmp_hook, hook_path)
 
                 # Step 4: Album art
                 art_filename = f"{song_title.replace(' ', '_')}_art.png"
