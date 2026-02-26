@@ -375,6 +375,85 @@ BATCH_SETTINGS_TESTS = [
 
 
 # ---------------------------------------------------------------------------
+# File Import helpers (mirror gui.py _parse_drop_data / _import_files logic)
+# ---------------------------------------------------------------------------
+
+def parse_drop_data(data: str) -> list:
+    """Parse tkinterdnd2 drop event data into a list of file paths."""
+    paths = []
+    i = 0
+    while i < len(data):
+        if data[i] == '{':
+            end = data.index('}', i + 1)
+            paths.append(data[i + 1:end])
+            i = end + 2
+        elif data[i] == ' ':
+            i += 1
+        else:
+            end = data.find(' ', i)
+            if end == -1:
+                end = len(data)
+            paths.append(data[i:end])
+            i = end + 1
+    return paths
+
+
+def resolve_import_dest(basename: str, downloads_dir: str) -> str:
+    """Resolve destination path, adding _2, _3 suffix for duplicates."""
+    dest = os.path.join(downloads_dir, basename)
+    if not os.path.exists(dest):
+        return dest
+    stem, ext = os.path.splitext(basename)
+    counter = 2
+    while os.path.exists(dest):
+        dest = os.path.join(downloads_dir, f"{stem}_{counter}{ext}")
+        counter += 1
+    return dest
+
+
+def filter_import_paths(paths: list, downloads_dir: str) -> tuple:
+    """Filter file paths: only MP3, not already in downloads. Returns (mp3_paths, skipped)."""
+    mp3 = []
+    skipped = 0
+    dl_norm = os.path.normpath(downloads_dir)
+    for p in paths:
+        p = p.strip()
+        if not p:
+            continue
+        if not p.lower().endswith(".mp3"):
+            skipped += 1
+            continue
+        if os.path.normpath(os.path.dirname(os.path.abspath(p))) == dl_norm:
+            skipped += 1
+            continue
+        mp3.append(p)
+    return mp3, skipped
+
+
+PARSE_DROP_TESTS = [
+    # (input, expected_paths, label)
+    ("C:/song1.mp3 C:/song2.mp3",
+     ["C:/song1.mp3", "C:/song2.mp3"],
+     "simple space-separated paths"),
+    ("{C:/My Music/song.mp3} C:/song2.mp3",
+     ["C:/My Music/song.mp3", "C:/song2.mp3"],
+     "braced path with spaces + simple path"),
+    ("{C:/My Music/my song.mp3}",
+     ["C:/My Music/my song.mp3"],
+     "single braced path"),
+    ("C:/a.mp3",
+     ["C:/a.mp3"],
+     "single path no braces"),
+    ("",
+     [],
+     "empty string"),
+    ("{C:/a b/c.mp3} {D:/x y/z.mp3}",
+     ["C:/a b/c.mp3", "D:/x y/z.mp3"],
+     "multiple braced paths"),
+]
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -479,6 +558,88 @@ def run_tests():
                 print(f"  FAIL  {label}")
                 print(f"        Expected: {expected}")
                 print(f"        Got:      {actual}")
+
+        # --- File Import Tests ---
+        print(f"\n=== Drop Data Parse Tests ===\n")
+        for data, expected, label in PARSE_DROP_TESTS:
+            actual = parse_drop_data(data)
+            if actual == expected:
+                passed += 1
+                print(f"  PASS  {label}")
+            else:
+                failed += 1
+                print(f"  FAIL  {label}")
+                print(f"        Expected: {expected}")
+                print(f"        Got:      {actual}")
+
+        print(f"\n=== Import Filter Tests ===\n")
+
+        # Non-MP3 filtering
+        mp3, skip = filter_import_paths(["a.mp3", "b.wav", "c.txt", "d.mp3"], tmp_dir)
+        if [os.path.basename(p) for p in mp3] == ["a.mp3", "d.mp3"] and skip == 2:
+            passed += 1
+            print("  PASS  non-MP3 files filtered out")
+        else:
+            failed += 1
+            print(f"  FAIL  non-MP3 filter — got mp3={mp3}, skip={skip}")
+
+        # Already in downloads dir skipped
+        in_dl = os.path.join(tmp_dir, "exists.mp3")
+        with open(in_dl, "w") as f:
+            f.write("fake")
+        mp3, skip = filter_import_paths([in_dl], tmp_dir)
+        if mp3 == [] and skip == 1:
+            passed += 1
+            print("  PASS  file already in downloads -> skipped")
+        else:
+            failed += 1
+            print(f"  FAIL  already-in-downloads — got mp3={mp3}, skip={skip}")
+
+        # Empty and whitespace paths
+        mp3, skip = filter_import_paths(["", "  ", "  x.mp3  "], tmp_dir)
+        # "  x.mp3  " after strip is "x.mp3" which ends with .mp3
+        if len(mp3) == 1 and skip == 0:
+            passed += 1
+            print("  PASS  empty/whitespace paths handled")
+        else:
+            failed += 1
+            print(f"  FAIL  empty paths — got mp3={mp3}, skip={skip}")
+
+        print(f"\n=== Import Duplicate Filename Tests ===\n")
+
+        dl_dir = os.path.join(tmp_dir, "downloads")
+        os.makedirs(dl_dir, exist_ok=True)
+
+        # No conflict
+        dest = resolve_import_dest("new_song.mp3", dl_dir)
+        if os.path.basename(dest) == "new_song.mp3":
+            passed += 1
+            print("  PASS  no conflict -> original name")
+        else:
+            failed += 1
+            print(f"  FAIL  no conflict — got {dest}")
+
+        # Create a file to trigger duplicate handling
+        with open(os.path.join(dl_dir, "song.mp3"), "w") as f:
+            f.write("fake")
+        dest = resolve_import_dest("song.mp3", dl_dir)
+        if os.path.basename(dest) == "song_2.mp3":
+            passed += 1
+            print("  PASS  first duplicate -> _2 suffix")
+        else:
+            failed += 1
+            print(f"  FAIL  first dup — got {os.path.basename(dest)}")
+
+        # Create _2 to get _3
+        with open(os.path.join(dl_dir, "song_2.mp3"), "w") as f:
+            f.write("fake")
+        dest = resolve_import_dest("song.mp3", dl_dir)
+        if os.path.basename(dest) == "song_3.mp3":
+            passed += 1
+            print("  PASS  second duplicate -> _3 suffix")
+        else:
+            failed += 1
+            print(f"  FAIL  second dup — got {os.path.basename(dest)}")
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

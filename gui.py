@@ -9,6 +9,7 @@ import json
 import logging
 import subprocess
 import re
+import shutil
 from urllib.parse import urlparse, parse_qs
 import threading
 import time
@@ -42,6 +43,13 @@ import tkinter.font as tkfont
 import tkinter.filedialog as tkfiledialog
 import tkinter.messagebox as tkmessagebox
 from PIL import Image as PILImage
+
+# Optional: drag-and-drop support
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _HAS_DND = True
+except ImportError:
+    _HAS_DND = False
 
 # Monkey-patch: soundfile 0.13+ removed SoundFileRuntimeError but librosa still expects it
 import soundfile as _sf
@@ -336,7 +344,21 @@ class HookToShortApp(ctk.CTk):
                       if self.tabview.get() == "อัปโหลด"
                       and str(self.upload_btn.cget("state")) != "disabled" else None)
         self.bind_all("<Control-r>", lambda e: self._refresh_library())
+        self.bind_all("<Control-i>", lambda e: self._on_import_files()
+                      if self.tabview.get() == "คลังเพลง" else None)
         self.bind_all("<Escape>", lambda e: self._stop_hook_preview())
+
+        # --- Drag-and-drop (optional) ---
+        self._dnd_enabled = False
+        if _HAS_DND:
+            try:
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind('<<Drop>>', self._on_drop_files)
+                self.dnd_bind('<<DropEnter>>', self._on_drag_enter)
+                self.dnd_bind('<<DropLeave>>', self._on_drag_leave)
+                self._dnd_enabled = True
+            except Exception:
+                pass  # DnD not compatible — file dialog still works
 
     # -----------------------------------------------------------------------
     # Log helpers
@@ -965,6 +987,13 @@ class HookToShortApp(ctk.CTk):
         )
         open_folder_btn.pack(side="right", padx=(0, 4))
 
+        import_btn = ctk.CTkButton(
+            top_bar, text="นำเข้าเพลง", width=100, font=self._font(13),
+            fg_color="#27ae60", hover_color="#2ecc71",
+            command=self._on_import_files,
+        )
+        import_btn.pack(side="right", padx=(0, 4))
+
         # Search & Sort bar
         filter_bar = ctk.CTkFrame(tab, fg_color="transparent")
         filter_bar.pack(fill="x", padx=8, pady=(0, 4))
@@ -987,10 +1016,126 @@ class HookToShortApp(ctk.CTk):
             command=lambda _: self._refresh_library(),
         ).pack(side="left")
 
+        # Drop hint (shown only when DnD is available)
+        if _HAS_DND:
+            self._drop_hint_label = ctk.CTkLabel(
+                tab, text="ลากไฟล์ MP3 มาวางที่นี่เพื่อนำเข้า",
+                font=self._font(11), text_color="gray",
+            )
+            self._drop_hint_label.pack(padx=8, pady=(0, 2))
+
         self.lib_scroll = ctk.CTkScrollableFrame(tab)
         self.lib_scroll.pack(fill="both", expand=True, padx=8, pady=4)
 
         self._refresh_library()
+
+    # -----------------------------------------------------------------------
+    # File Import
+    # -----------------------------------------------------------------------
+
+    def _on_import_files(self):
+        """Open file dialog to select MP3 files for import."""
+        paths = tkfiledialog.askopenfilenames(
+            title="เลือกไฟล์เพลง MP3",
+            filetypes=[("MP3 files", "*.mp3"), ("All files", "*.*")],
+        )
+        if paths:
+            self._import_files(list(paths))
+
+    def _import_files(self, file_paths: list):
+        """Copy MP3 files into downloads folder, skip duplicates, refresh library."""
+        imported = 0
+        skipped = 0
+        downloads = os.path.abspath(DOWNLOADS_FOLDER)
+
+        for src in file_paths:
+            src = src.strip()
+            if not src:
+                continue
+
+            # Only accept .mp3
+            if not src.lower().endswith(".mp3"):
+                skipped += 1
+                continue
+
+            src_abs = os.path.abspath(src)
+
+            # Skip if already in downloads folder
+            if os.path.normpath(os.path.dirname(src_abs)) == os.path.normpath(downloads):
+                skipped += 1
+                continue
+
+            basename = os.path.basename(src)
+            dest = os.path.join(downloads, basename)
+
+            # Handle duplicate filenames: song.mp3 → song_2.mp3, song_3.mp3 …
+            if os.path.exists(dest):
+                stem, ext = os.path.splitext(basename)
+                counter = 2
+                while os.path.exists(dest):
+                    dest = os.path.join(downloads, f"{stem}_{counter}{ext}")
+                    counter += 1
+
+            try:
+                shutil.copy2(src, dest)
+                imported += 1
+            except OSError as e:
+                logger.error(f"Import failed for {basename}: {e}")
+                skipped += 1
+
+        total = imported + skipped
+        if imported > 0:
+            self.status_var.set(f"นำเข้า {imported}/{total} เพลงสำเร็จ")
+            self._refresh_library()
+            self._refresh_track_dropdown()
+        elif total > 0:
+            self.status_var.set("ไม่มีไฟล์ MP3 ที่นำเข้าได้")
+        logger.info(f"Import: {imported} imported, {skipped} skipped out of {total}")
+
+    @staticmethod
+    def _parse_drop_data(data: str) -> list:
+        """Parse tkinterdnd2 drop event data into a list of file paths.
+
+        Format: space-separated paths; paths with spaces wrapped in {braces}.
+        Example: '{C:/My Music/song.mp3} C:/song2.mp3'
+        """
+        paths = []
+        i = 0
+        while i < len(data):
+            if data[i] == '{':
+                end = data.index('}', i + 1)
+                paths.append(data[i + 1:end])
+                i = end + 2  # skip } and space
+            elif data[i] == ' ':
+                i += 1
+            else:
+                end = data.find(' ', i)
+                if end == -1:
+                    end = len(data)
+                paths.append(data[i:end])
+                i = end + 1
+        return paths
+
+    def _on_drop_files(self, event):
+        """Handle drag-and-drop file event from tkinterdnd2."""
+        paths = self._parse_drop_data(event.data)
+        mp3_paths = [p for p in paths if p.lower().endswith(".mp3")]
+        if mp3_paths:
+            self._import_files(mp3_paths)
+        elif paths:
+            self.status_var.set("รองรับเฉพาะไฟล์ MP3 เท่านั้น")
+
+    def _on_drag_enter(self, event):
+        """Visual feedback when dragging files over the window."""
+        if hasattr(self, '_drop_hint_label'):
+            self._drop_hint_label.configure(text_color="#2ecc71")
+        return event.action
+
+    def _on_drag_leave(self, event):
+        """Restore visual state when drag leaves."""
+        if hasattr(self, '_drop_hint_label'):
+            self._drop_hint_label.configure(text_color="gray")
+        return event.action
 
     def _debounced_refresh_library(self):
         """Debounce search input — wait 250ms after last keystroke before refreshing."""
