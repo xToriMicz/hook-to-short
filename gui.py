@@ -330,9 +330,11 @@ class HookToShortApp(ctk.CTk):
 
         # --- Keyboard shortcuts ---
         self.bind_all("<Control-g>", lambda e: self._on_generate()
-                      if self.tabview.get() == "สร้างวิดีโอสั้น" else None)
+                      if self.tabview.get() == "สร้างวิดีโอสั้น"
+                      and str(self.generate_btn.cget("state")) != "disabled" else None)
         self.bind_all("<Control-u>", lambda e: self._on_upload()
-                      if self.tabview.get() == "อัปโหลด" else None)
+                      if self.tabview.get() == "อัปโหลด"
+                      and str(self.upload_btn.cget("state")) != "disabled" else None)
         self.bind_all("<Control-r>", lambda e: self._refresh_library())
         self.bind_all("<Escape>", lambda e: self._stop_hook_preview())
 
@@ -968,12 +970,13 @@ class HookToShortApp(ctk.CTk):
         filter_bar.pack(fill="x", padx=8, pady=(0, 4))
 
         self.lib_search_var = ctk.StringVar(value="")
+        self._lib_search_after_id = None
         self.lib_search_entry = ctk.CTkEntry(
             filter_bar, textvariable=self.lib_search_var,
             placeholder_text="ค้นหาชื่อเพลง / ศิลปิน...",
             width=300, font=self._font(12))
         self.lib_search_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.lib_search_var.trace_add("write", lambda *_: self._refresh_library())
+        self.lib_search_var.trace_add("write", lambda *_: self._debounced_refresh_library())
 
         ctk.CTkLabel(filter_bar, text="เรียง:", font=self._font(12)).pack(side="left", padx=(0, 4))
         self.lib_sort_var = ctk.StringVar(value="ใหม่สุด")
@@ -988,6 +991,12 @@ class HookToShortApp(ctk.CTk):
         self.lib_scroll.pack(fill="both", expand=True, padx=8, pady=4)
 
         self._refresh_library()
+
+    def _debounced_refresh_library(self):
+        """Debounce search input — wait 250ms after last keystroke before refreshing."""
+        if self._lib_search_after_id is not None:
+            self.after_cancel(self._lib_search_after_id)
+        self._lib_search_after_id = self.after(250, self._refresh_library)
 
     def _refresh_library(self):
         for widget in self.lib_scroll.winfo_children():
@@ -1932,6 +1941,7 @@ class HookToShortApp(ctk.CTk):
 
             gen_btn.configure(state="disabled")
             close_btn.configure(state="disabled")
+            dialog.protocol("WM_DELETE_WINDOW", lambda: None)  # prevent close during batch
             progress_bar.set(0)
             progress_bar.pack(padx=12, pady=(0, 4))
 
@@ -2033,6 +2043,7 @@ class HookToShortApp(ctk.CTk):
                         text=f"เสร็จ! สร้างสำเร็จ {success}/{total} วิดีโอ")
                     gen_btn.configure(state="normal")
                     close_btn.configure(state="normal")
+                    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
                     self._refresh_upload_videos()
                     self.status_var.set(f"Batch: สร้างเสร็จ {success}/{total}")
                 dialog.after(0, done)

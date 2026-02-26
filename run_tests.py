@@ -5,6 +5,7 @@ import importlib
 suites = [
     "test_classify_url",
     "test_gui_feedback",
+    "test_tier2",
 ]
 
 all_passed = True
