@@ -14,6 +14,7 @@ import os
 import json
 import time
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable
 from pathlib import Path
 
@@ -405,6 +406,68 @@ def _find_post_button(driver, timeout: int = 30):
     return None
 
 
+def _find_schedule_button(driver, timeout: int = 30):
+    """Find the Schedule button (replaces Post when scheduling is enabled).
+
+    Returns the button element or None.
+    """
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.common.by import By
+
+    # Strategy 1: data-e2e attribute
+    css_selectors = [
+        'button[data-e2e="post_video_button"]',
+        'button[data-e2e="schedule_button"]',
+        'button[data-e2e="post-button"]',
+    ]
+    for selector in css_selectors:
+        try:
+            btn = WebDriverWait(driver, min(timeout, 10)).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+            )
+            if btn:
+                return btn
+        except Exception:
+            continue
+
+    # Strategy 2: XPath text matching
+    xpath_selectors = [
+        '//button[contains(text(), "Schedule")]',
+        '//button[contains(text(), "schedule")]',
+        '//button[.//div[text()="Schedule"]]',
+        '//button[contains(text(), "Post")]',
+    ]
+    for xpath in xpath_selectors:
+        try:
+            btn = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.XPATH, xpath))
+            )
+            if btn:
+                return btn
+        except Exception:
+            continue
+
+    # Strategy 3: JS-based search
+    try:
+        btn = driver.execute_script("""
+            var buttons = document.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {
+                var text = (buttons[i].textContent || '').trim().toLowerCase();
+                if (text === 'schedule' || text === 'post') {
+                    return buttons[i];
+                }
+            }
+            return null;
+        """)
+        if btn:
+            return btn
+    except Exception:
+        pass
+
+    return None
+
+
 def _wait_for_upload_success(driver, timeout: int = 60) -> bool:
     """Wait for TikTok to confirm the upload was successful.
 
@@ -424,6 +487,9 @@ def _wait_for_upload_success(driver, timeout: int = 60) -> bool:
         '//*[contains(text(), "upload another")]',
         '//*[contains(text(), "Your video has been")]',
         '//*[contains(text(), "video is live")]',
+        '//*[contains(text(), "scheduled")]',
+        '//*[contains(text(), "will be posted")]',
+        '//*[contains(text(), "video is scheduled")]',
     ]
 
     start = time.time()
@@ -454,7 +520,8 @@ def _wait_for_upload_success(driver, timeout: int = 60) -> bool:
             found = driver.execute_script("""
                 var body = document.body.innerText.toLowerCase();
                 var signals = ['uploaded', 'manage your posts', 'upload another',
-                               'successfully', 'video is live', 'being processed'];
+                               'successfully', 'video is live', 'being processed',
+                               'scheduled', 'will be posted', 'video is scheduled'];
                 for (var i = 0; i < signals.length; i++) {
                     if (body.indexOf(signals[i]) !== -1) return true;
                 }
@@ -470,6 +537,280 @@ def _wait_for_upload_success(driver, timeout: int = 60) -> bool:
 
     logger.warning("TikTok: ไม่พบสัญญาณสำเร็จชัดเจน — ถือว่าสำเร็จ (best-effort)")
     return False
+
+
+# ---------------------------------------------------------------------------
+# TikTok Scheduling — browser automation for the schedule toggle + date/time
+# ---------------------------------------------------------------------------
+# Constraints: >=20 min in future, <=10 days, minutes in multiples of 5.
+# Reference: TikTok creator-center upload page (English UI).
+
+TIKTOK_MIN_SCHEDULE_MINUTES = 20
+TIKTOK_MAX_SCHEDULE_DAYS = 10
+TIKTOK_MINUTE_MULTIPLE = 5
+
+# XPath selectors for TikTok's scheduling UI
+_SCHED_SELECTORS = {
+    # Schedule toggle — TikTok uses a radio/switch button
+    "switch": [
+        '//*[@id="tux-1"]',
+        '//div[contains(@class, "switch") and contains(@class, "schedule")]',
+        '//label[contains(text(), "Schedule")]/ancestor::div[contains(@class, "switch")]',
+        '//span[contains(text(), "Schedule video")]/ancestor::label',
+    ],
+    "date_picker": "//div[contains(@class, 'date-picker-input')]",
+    "calendar": "//div[contains(@class, 'calendar-wrapper')]",
+    "calendar_month": "//span[contains(@class, 'month-title')]",
+    "calendar_valid_days": (
+        "//div[contains(@class, 'days-wrapper')]"
+        "//span[contains(@class, 'day') and contains(@class, 'valid')]"
+    ),
+    "calendar_arrows": "//span[contains(@class, 'arrow')]",
+    "time_picker": "//div[contains(@class, 'time-picker-input')]",
+    "time_picker_container": "//div[contains(@class, 'time-picker-container')]",
+    "timepicker_hours": "//span[contains(@class, 'tiktok-timepicker-left')]",
+    "timepicker_minutes": "//span[contains(@class, 'tiktok-timepicker-right')]",
+    "time_picker_text": "//div[contains(@class, 'time-picker-input')]/*[1]",
+}
+
+
+def validate_tiktok_schedule(publish_at_iso: str) -> datetime:
+    """Validate and adjust a publish_at ISO string for TikTok's constraints.
+
+    Returns a timezone-aware datetime rounded to the nearest 5-minute multiple.
+    Raises ValueError if the time is out of TikTok's allowed range.
+    """
+    dt = datetime.fromisoformat(publish_at_iso)
+    if dt.tzinfo is None:
+        # Assume ICT (UTC+7) if no timezone
+        ict = timezone(timedelta(hours=7))
+        dt = dt.replace(tzinfo=ict)
+
+    # Round minutes up to nearest 5-minute multiple
+    remainder = dt.minute % TIKTOK_MINUTE_MULTIPLE
+    if remainder != 0:
+        dt += timedelta(minutes=TIKTOK_MINUTE_MULTIPLE - remainder)
+        dt = dt.replace(second=0, microsecond=0)
+
+    now_utc = datetime.now(timezone.utc)
+    min_time = now_utc + timedelta(minutes=TIKTOK_MIN_SCHEDULE_MINUTES)
+    max_time = now_utc + timedelta(days=TIKTOK_MAX_SCHEDULE_DAYS)
+
+    if dt < min_time:
+        raise ValueError(
+            f"TikTok ตั้งเวลาได้อย่างน้อย {TIKTOK_MIN_SCHEDULE_MINUTES} นาทีในอนาคต"
+        )
+    if dt > max_time:
+        raise ValueError(
+            f"TikTok ตั้งเวลาได้ไม่เกิน {TIKTOK_MAX_SCHEDULE_DAYS} วัน"
+        )
+
+    return dt
+
+
+def _set_schedule_video(driver, schedule_dt: datetime):
+    """Enable TikTok scheduling and set date/time via browser automation.
+
+    Args:
+        driver: Selenium WebDriver
+        schedule_dt: timezone-aware datetime (already validated & rounded)
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    # Get browser timezone and convert schedule to it
+    browser_tz_name = driver.execute_script(
+        "return Intl.DateTimeFormat().resolvedOptions().timeZone")
+    try:
+        import zoneinfo
+        browser_tz = zoneinfo.ZoneInfo(browser_tz_name)
+    except (ImportError, KeyError):
+        # Fallback: use UTC offset from browser
+        offset_min = driver.execute_script(
+            "return -new Date().getTimezoneOffset()")
+        browser_tz = timezone(timedelta(minutes=offset_min))
+
+    local_dt = schedule_dt.astimezone(browser_tz)
+    target_month = local_dt.month
+    target_day = local_dt.day
+    target_hour = local_dt.hour
+    target_minute = local_dt.minute
+
+    logger.info(f"TikTok: ตั้งเวลา {local_dt.strftime('%Y-%m-%d %H:%M')} "
+                f"(tz: {browser_tz_name})")
+
+    # Step 1: Click schedule toggle/switch
+    _click_schedule_switch(driver)
+    time.sleep(1)
+
+    # Step 2: Set date
+    _pick_schedule_date(driver, target_month, target_day)
+    time.sleep(0.5)
+
+    # Step 3: Set time
+    _pick_schedule_time(driver, target_hour, target_minute)
+    time.sleep(0.5)
+
+    logger.info("TikTok: ตั้งเวลาสำเร็จ")
+
+
+def _click_schedule_switch(driver):
+    """Click the schedule toggle switch using multiple selector strategies."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    selectors = _SCHED_SELECTORS["switch"]
+    for xpath in selectors:
+        try:
+            el = WebDriverWait(driver, 5).until(
+                lambda d, x=xpath: d.find_element(By.XPATH, x)
+            )
+            if el and el.is_displayed():
+                driver.execute_script("arguments[0].scrollIntoView(true);", el)
+                time.sleep(0.3)
+                driver.execute_script("arguments[0].click();", el)
+                logger.debug(f"TikTok: schedule switch clicked via: {xpath}")
+                return
+        except Exception:
+            continue
+
+    # Fallback: JS search for any element with "Schedule" text
+    clicked = driver.execute_script("""
+        // Look for radio/toggle with "Schedule" label text
+        var labels = document.querySelectorAll('label, span, div');
+        for (var i = 0; i < labels.length; i++) {
+            var text = (labels[i].textContent || '').trim().toLowerCase();
+            if (text === 'schedule video' || text === 'schedule') {
+                // Click the parent container or the element itself
+                var target = labels[i].closest('label') || labels[i];
+                target.click();
+                return true;
+            }
+        }
+        return false;
+    """)
+    if clicked:
+        logger.debug("TikTok: schedule switch clicked via JS fallback")
+        return
+
+    raise Exception("TikTok: หาปุ่ม Schedule ไม่เจอ")
+
+
+def _pick_schedule_date(driver, month: int, day: int):
+    """Navigate TikTok's calendar and select the target date."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    # Click date picker to open calendar
+    date_picker = WebDriverWait(driver, 10).until(
+        lambda d: d.find_element(By.XPATH, _SCHED_SELECTORS["date_picker"])
+    )
+    driver.execute_script("arguments[0].click();", date_picker)
+    time.sleep(1)
+
+    # Wait for calendar to appear
+    WebDriverWait(driver, 10).until(
+        EC.visibility_of_element_located((By.XPATH, _SCHED_SELECTORS["calendar"]))
+    )
+
+    # Check current month and navigate if needed
+    month_el = driver.find_element(By.XPATH, _SCHED_SELECTORS["calendar_month"])
+    current_month_name = month_el.text.strip()
+    try:
+        current_month = datetime.strptime(current_month_name, "%B").month
+    except ValueError:
+        # Try abbreviated month name
+        current_month = datetime.strptime(current_month_name[:3], "%b").month
+
+    # Navigate months (forward or backward)
+    max_nav = 12  # safety limit
+    while current_month != month and max_nav > 0:
+        arrows = driver.find_elements(By.XPATH, _SCHED_SELECTORS["calendar_arrows"])
+        if not arrows or len(arrows) < 2:
+            break
+        if current_month < month:
+            driver.execute_script("arguments[0].click();", arrows[-1])  # next
+        else:
+            driver.execute_script("arguments[0].click();", arrows[0])  # prev
+        time.sleep(0.5)
+        month_el = driver.find_element(By.XPATH, _SCHED_SELECTORS["calendar_month"])
+        current_month_name = month_el.text.strip()
+        try:
+            current_month = datetime.strptime(current_month_name, "%B").month
+        except ValueError:
+            current_month = datetime.strptime(current_month_name[:3], "%b").month
+        max_nav -= 1
+
+    # Click the target day
+    valid_days = driver.find_elements(
+        By.XPATH, _SCHED_SELECTORS["calendar_valid_days"])
+
+    clicked = False
+    for day_el in valid_days:
+        if day_el.text.strip() == str(day):
+            driver.execute_script("arguments[0].click();", day_el)
+            clicked = True
+            break
+
+    if not clicked:
+        raise Exception(f"TikTok: หาวันที่ {day} ไม่เจอในปฏิทิน")
+
+    logger.debug(f"TikTok: เลือกวันที่ {month}/{day}")
+
+
+def _pick_schedule_time(driver, hour: int, minute: int):
+    """Select hour and minute from TikTok's time picker."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    # Click time picker to open dropdown
+    time_picker = WebDriverWait(driver, 10).until(
+        lambda d: d.find_element(By.XPATH, _SCHED_SELECTORS["time_picker"])
+    )
+    driver.execute_script("arguments[0].click();", time_picker)
+    time.sleep(1)
+
+    # Wait for time picker container
+    WebDriverWait(driver, 10).until(
+        EC.visibility_of_element_located((
+            By.XPATH, _SCHED_SELECTORS["time_picker_container"]))
+    )
+
+    # Select hour (0-23, directly indexable)
+    hour_options = driver.find_elements(
+        By.XPATH, _SCHED_SELECTORS["timepicker_hours"])
+    if hour < len(hour_options):
+        target_hour = hour_options[hour]
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", target_hour)
+        time.sleep(0.3)
+        driver.execute_script("arguments[0].click();", target_hour)
+    else:
+        raise Exception(f"TikTok: หาชั่วโมง {hour} ไม่เจอ (มี {len(hour_options)} ตัวเลือก)")
+
+    time.sleep(0.5)
+
+    # Select minute (in multiples of 5, so index = minute / 5)
+    minute_options = driver.find_elements(
+        By.XPATH, _SCHED_SELECTORS["timepicker_minutes"])
+    minute_idx = minute // TIKTOK_MINUTE_MULTIPLE
+    if minute_idx < len(minute_options):
+        target_minute = minute_options[minute_idx]
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", target_minute)
+        time.sleep(0.3)
+        driver.execute_script("arguments[0].click();", target_minute)
+    else:
+        raise Exception(f"TikTok: หานาที {minute} ไม่เจอ (มี {len(minute_options)} ตัวเลือก)")
+
+    # Close time picker by clicking it again
+    driver.execute_script("arguments[0].click();", time_picker)
+    time.sleep(0.5)
+
+    logger.debug(f"TikTok: เลือกเวลา {hour:02d}:{minute:02d}")
 
 
 class TikTokBrowserUploader:
@@ -678,6 +1019,23 @@ class TikTokBrowserUploader:
                 logger.warning(f"TikTok: กรอก caption ไม่ได้ — {e}")
 
             if progress_callback:
+                progress_callback(0.6)
+
+            # Step 6.5: Set schedule if publish_at is provided
+            is_scheduled = False
+            if request.publish_at:
+                try:
+                    schedule_dt = validate_tiktok_schedule(request.publish_at)
+                    _set_schedule_video(driver, schedule_dt)
+                    is_scheduled = True
+                    logger.info(f"TikTok: ตั้งเวลาโพส {schedule_dt.strftime('%Y-%m-%d %H:%M')}")
+                except ValueError as e:
+                    logger.warning(f"TikTok: ตั้งเวลาไม่ได้ — {e} — โพสทันทีแทน")
+                except Exception as e:
+                    logger.warning(f"TikTok: ตั้งเวลาไม่สำเร็จ — {e} — โพสทันทีแทน")
+                    self._screenshot_on_error(driver, "schedule")
+
+            if progress_callback:
                 progress_callback(0.7)
 
             # Step 7: Wait for upload/processing to finish before clicking post
@@ -687,22 +1045,26 @@ class TikTokBrowserUploader:
             # Dismiss overlays one more time before clicking Post
             _dismiss_overlays(driver)
 
-            # Step 8: Click Post/Publish button
+            # Step 8: Click Post/Schedule button
+            btn_label = "Schedule" if is_scheduled else "Post"
             try:
-                post_btn = _find_post_button(driver, timeout=30)
+                if is_scheduled:
+                    post_btn = _find_schedule_button(driver, timeout=30)
+                else:
+                    post_btn = _find_post_button(driver, timeout=30)
 
                 if post_btn:
                     # Use JS click to bypass any overlay
                     driver.execute_script("arguments[0].scrollIntoView(true);", post_btn)
                     time.sleep(1)
                     driver.execute_script("arguments[0].click();", post_btn)
-                    logger.info("TikTok: กดปุ่ม Post แล้ว")
+                    logger.info(f"TikTok: กดปุ่ม {btn_label} แล้ว")
                 else:
                     self._screenshot_on_error(driver, "post_button")
                     return UploadResult(
                         platform="TikTok",
                         status=UploadStatus.FAILED,
-                        error="หาปุ่ม Post ไม่เจอ — ดู screenshot ใน outputs/",
+                        error=f"หาปุ่ม {btn_label} ไม่เจอ — ดู screenshot ใน outputs/",
                     )
 
             except Exception as e:
@@ -710,37 +1072,37 @@ class TikTokBrowserUploader:
                 return UploadResult(
                     platform="TikTok",
                     status=UploadStatus.FAILED,
-                    error=f"กดปุ่ม Post ไม่ได้: {str(e)[:100]}",
+                    error=f"กดปุ่ม {btn_label} ไม่ได้: {str(e)[:100]}",
                 )
 
             # Step 8.5: Handle "Continue to post?" confirmation dialog
             # TikTok shows this while still checking video for issues
-            # Wait up to 15s for the dialog to appear, then click "Post now"
-            try:
-                post_now_btn = WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((
-                        By.XPATH,
-                        '//button[contains(text(), "Post") and contains(text(), "now")]'
-                    ))
-                )
-                time.sleep(0.5)
-                driver.execute_script("arguments[0].click();", post_now_btn)
-                logger.info("TikTok: กดปุ่ม 'Post now' (confirm dialog) แล้ว")
-            except Exception:
-                # No confirmation dialog appeared — that's fine, video check may have passed
-                # Also try generic red/primary button in any visible dialog
+            # (only for immediate posts — scheduled posts don't show this)
+            if not is_scheduled:
                 try:
-                    confirm_btn = driver.find_element(
-                        By.CSS_SELECTOR,
-                        'div[role="dialog"] button[class*="primary"], '
-                        'div[role="dialog"] button[class*="red"], '
-                        'div[role="dialog"] button:last-child'
+                    post_now_btn = WebDriverWait(driver, 15).until(
+                        EC.presence_of_element_located((
+                            By.XPATH,
+                            '//button[contains(text(), "Post") and contains(text(), "now")]'
+                        ))
                     )
-                    if confirm_btn and confirm_btn.is_displayed():
-                        driver.execute_script("arguments[0].click();", confirm_btn)
-                        logger.info("TikTok: กดปุ่ม confirm ใน dialog แล้ว")
+                    time.sleep(0.5)
+                    driver.execute_script("arguments[0].click();", post_now_btn)
+                    logger.info("TikTok: กดปุ่ม 'Post now' (confirm dialog) แล้ว")
                 except Exception:
-                    pass
+                    # No confirmation dialog — that's fine
+                    try:
+                        confirm_btn = driver.find_element(
+                            By.CSS_SELECTOR,
+                            'div[role="dialog"] button[class*="primary"], '
+                            'div[role="dialog"] button[class*="red"], '
+                            'div[role="dialog"] button:last-child'
+                        )
+                        if confirm_btn and confirm_btn.is_displayed():
+                            driver.execute_script("arguments[0].click();", confirm_btn)
+                            logger.info("TikTok: กดปุ่ม confirm ใน dialog แล้ว")
+                    except Exception:
+                        pass
 
             if progress_callback:
                 progress_callback(0.9)

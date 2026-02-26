@@ -406,6 +406,88 @@ SCHEDULE_TESTS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# TikTok scheduling validation (mirrors validate_tiktok_schedule)
+# ---------------------------------------------------------------------------
+
+def validate_tiktok_schedule(publish_at_iso: str):
+    """Mirror validate_tiktok_schedule() from tiktok_browser.py.
+
+    Validates: >=20 min future, <=10 days, rounds to 5-min multiples.
+    Returns adjusted datetime on success, raises ValueError on failure.
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    dt = _dt.fromisoformat(publish_at_iso)
+    if dt.tzinfo is None:
+        ict = _tz(_td(hours=7))
+        dt = dt.replace(tzinfo=ict)
+
+    # Round minutes to nearest 5
+    remainder = dt.minute % 5
+    if remainder != 0:
+        dt += _td(minutes=5 - remainder)
+        dt = dt.replace(second=0, microsecond=0)
+
+    now_utc = _dt.now(_tz.utc)
+    min_time = now_utc + _td(minutes=20)
+    max_time = now_utc + _td(days=10)
+
+    if dt < min_time:
+        raise ValueError("TikTok ตั้งเวลาได้อย่างน้อย 20 นาทีในอนาคต")
+    if dt > max_time:
+        raise ValueError("TikTok ตั้งเวลาได้ไม่เกิน 10 วัน")
+
+    return dt
+
+
+def _make_future_iso(hours: int = 0, days: int = 0, minutes: int = 0) -> str:
+    """Helper: generate ISO datetime string at a future offset from now."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    ict = _tz(_td(hours=7))
+    dt = _dt.now(ict) + _td(hours=hours, days=days, minutes=minutes)
+    # Round to nearest 5 min for clean comparison
+    remainder = dt.minute % 5
+    if remainder != 0:
+        dt += _td(minutes=5 - remainder)
+    dt = dt.replace(second=0, microsecond=0)
+    return dt.isoformat()
+
+
+# TikTok schedule tests: (iso_string_or_factory, should_pass, label)
+TIKTOK_SCHEDULE_TESTS = [
+    # Too soon (5 min from now)
+    (lambda: _make_future_iso(minutes=5), False, "5 min from now -> too soon"),
+    # Just barely enough (25 min from now)
+    (lambda: _make_future_iso(minutes=25), True, "25 min from now -> OK"),
+    # 1 hour from now
+    (lambda: _make_future_iso(hours=1), True, "1 hour from now -> OK"),
+    # 1 day from now
+    (lambda: _make_future_iso(days=1), True, "1 day from now -> OK"),
+    # 5 days from now
+    (lambda: _make_future_iso(days=5), True, "5 days from now -> OK"),
+    # 10 days from now (borderline)
+    (lambda: _make_future_iso(days=9, hours=23), True, "9 days 23h from now -> OK"),
+    # 11 days from now (too far)
+    (lambda: _make_future_iso(days=11), False, "11 days from now -> too far"),
+    # Past datetime
+    ("2020-01-01T12:00:00+07:00", False, "past date -> error"),
+]
+
+# TikTok minute rounding tests: (minute_in, expected_rounded)
+TIKTOK_MINUTE_ROUND_TESTS = [
+    (0, 0, "0 stays 0"),
+    (5, 5, "5 stays 5"),
+    (10, 10, "10 stays 10"),
+    (1, 5, "1 rounds to 5"),
+    (3, 5, "3 rounds to 5"),
+    (7, 10, "7 rounds to 10"),
+    (11, 15, "11 rounds to 15"),
+    (14, 15, "14 rounds to 15"),
+    (58, 0, "58 rounds to 0 (next hour)"),
+]
+
+
 def run_tests():
     passed = 0
     failed = 0
@@ -559,6 +641,52 @@ def run_tests():
                 failed += 1
                 print(f"  FAIL  {label}")
                 print(f"        Expected success but got: {e}")
+
+    print(f"\n=== TikTok Schedule Validation Tests ===\n")
+    for iso_or_fn, should_pass, label in TIKTOK_SCHEDULE_TESTS:
+        iso_str = iso_or_fn() if callable(iso_or_fn) else iso_or_fn
+        try:
+            validate_tiktok_schedule(iso_str)
+            ok = should_pass
+            if ok:
+                passed += 1
+                print(f"  PASS  {label}")
+            else:
+                failed += 1
+                print(f"  FAIL  {label}")
+                print(f"        Expected error but got success")
+        except ValueError as e:
+            ok = not should_pass
+            if ok:
+                passed += 1
+                print(f"  PASS  {label} (error: {e})")
+            else:
+                failed += 1
+                print(f"  FAIL  {label}")
+                print(f"        Expected success but got: {e}")
+
+    print(f"\n=== TikTok Minute Rounding Tests ===\n")
+    for minute_in, expected_out, label in TIKTOK_MINUTE_ROUND_TESTS:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        ict = _tz(_td(hours=7))
+        # Build a datetime 2 days in future with the given minute
+        base = _dt.now(ict) + _td(days=2)
+        base = base.replace(minute=minute_in, second=0, microsecond=0)
+        try:
+            result = validate_tiktok_schedule(base.isoformat())
+            actual_minute = result.minute
+            ok = actual_minute == expected_out
+            if ok:
+                passed += 1
+                print(f"  PASS  {label}")
+            else:
+                failed += 1
+                print(f"  FAIL  {label}")
+                print(f"        Expected minute={expected_out}, got minute={actual_minute}")
+        except ValueError as e:
+            failed += 1
+            print(f"  FAIL  {label}")
+            print(f"        Unexpected error: {e}")
 
     print(f"\n{'='*50}")
     print(f"Results: {passed} passed, {failed} failed, {passed + failed} total")

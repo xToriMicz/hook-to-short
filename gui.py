@@ -2209,11 +2209,17 @@ class HookToShortApp(ctk.CTk):
                 dt = _dt.fromisoformat(publish_at)
                 schedule_note = f" (ตั้งเวลา {dt.strftime('%d/%m %H:%M')})"
 
-            # TikTok: ignore scheduling (browser automation can't schedule)
+            # TikTok scheduling: validate constraints (20min–10day, 5-min multiples)
+            # If invalid, gracefully fall back to immediate post
             if platform == "tiktok" and publish_at:
-                publish_at = None
-                privacy = "public"
-                schedule_note = " (TikTok: โพสทันที)"
+                try:
+                    from python.uploaders.tiktok_browser import validate_tiktok_schedule
+                    validate_tiktok_schedule(publish_at)
+                except ValueError as e:
+                    logger.warning(f"TikTok schedule: {e} — โพสทันที")
+                    publish_at = None
+                    privacy = "public"
+                    schedule_note = f" (TikTok: โพสทันที — {e})"
 
             # Build request per platform
             if platform == "tiktok":
