@@ -490,14 +490,15 @@ class HookToShortApp(ctk.CTk):
             self.dl_progress.configure(text="กรุณาใส่ลิงก์ YouTube")
             return
 
-        # Warn if URL contains a playlist param
-        if 'list=' in url:
-            self.dl_progress.configure(
-                text="ลิงก์นี้มี playlist — ถ้าต้องการโหลดทั้ง playlist ให้ใช้สแกนด้านล่าง")
-
         self.download_btn.configure(state="disabled")
         self.dl_result_frame.pack_forget()
-        self.dl_progress.configure(text="กำลังดาวน์โหลด... อาจใช้เวลาสักครู่")
+
+        # Warn if URL contains a playlist param (prepend to progress text)
+        if 'list=' in url:
+            self.dl_progress.configure(
+                text="[มี playlist — ใช้สแกนด้านล่าง] กำลังดาวน์โหลดเฉพาะคลิปนี้...")
+        else:
+            self.dl_progress.configure(text="กำลังดาวน์โหลด... อาจใช้เวลาสักครู่")
         self.status_var.set("กำลังดาวน์โหลดเพลง...")
 
         def task():
