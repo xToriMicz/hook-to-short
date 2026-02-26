@@ -328,6 +328,14 @@ class HookToShortApp(ctk.CTk):
         # Redirect Python logging into the log panel
         self._setup_log_handler()
 
+        # --- Keyboard shortcuts ---
+        self.bind_all("<Control-g>", lambda e: self._on_generate()
+                      if self.tabview.get() == "สร้างวิดีโอสั้น" else None)
+        self.bind_all("<Control-u>", lambda e: self._on_upload()
+                      if self.tabview.get() == "อัปโหลด" else None)
+        self.bind_all("<Control-r>", lambda e: self._refresh_library())
+        self.bind_all("<Escape>", lambda e: self._stop_hook_preview())
+
     # -----------------------------------------------------------------------
     # Log helpers
     # -----------------------------------------------------------------------
@@ -955,6 +963,27 @@ class HookToShortApp(ctk.CTk):
         )
         open_folder_btn.pack(side="right", padx=(0, 4))
 
+        # Search & Sort bar
+        filter_bar = ctk.CTkFrame(tab, fg_color="transparent")
+        filter_bar.pack(fill="x", padx=8, pady=(0, 4))
+
+        self.lib_search_var = ctk.StringVar(value="")
+        self.lib_search_entry = ctk.CTkEntry(
+            filter_bar, textvariable=self.lib_search_var,
+            placeholder_text="ค้นหาชื่อเพลง / ศิลปิน...",
+            width=300, font=self._font(12))
+        self.lib_search_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.lib_search_var.trace_add("write", lambda *_: self._refresh_library())
+
+        ctk.CTkLabel(filter_bar, text="เรียง:", font=self._font(12)).pack(side="left", padx=(0, 4))
+        self.lib_sort_var = ctk.StringVar(value="ใหม่สุด")
+        ctk.CTkComboBox(
+            filter_bar, variable=self.lib_sort_var,
+            values=["ใหม่สุด", "เก่าสุด", "ชื่อ A-Z", "ชื่อ Z-A", "ขนาดมาก-น้อย"],
+            width=130, state="readonly", font=self._font(12),
+            command=lambda _: self._refresh_library(),
+        ).pack(side="left")
+
         self.lib_scroll = ctk.CTkScrollableFrame(tab)
         self.lib_scroll.pack(fill="both", expand=True, padx=8, pady=4)
 
@@ -965,10 +994,37 @@ class HookToShortApp(ctk.CTk):
             widget.destroy()
 
         tracks = sync_tracks_with_folder()
-        self.lib_count_label.configure(text=f"เพลง: {len(tracks)} เพลง")
+        total = len(tracks)
+
+        # Apply search filter
+        query = self.lib_search_var.get().strip().lower()
+        if query:
+            tracks = [t for t in tracks
+                      if query in t.get("title", "").lower()
+                      or query in t.get("artist", "").lower()]
+
+        # Apply sort
+        sort_mode = self.lib_sort_var.get()
+        if sort_mode == "เก่าสุด":
+            tracks.sort(key=lambda t: t.get("created_at", ""))
+        elif sort_mode == "ใหม่สุด":
+            tracks.sort(key=lambda t: t.get("created_at", ""), reverse=True)
+        elif sort_mode == "ชื่อ A-Z":
+            tracks.sort(key=lambda t: t.get("title", "").lower())
+        elif sort_mode == "ชื่อ Z-A":
+            tracks.sort(key=lambda t: t.get("title", "").lower(), reverse=True)
+        elif sort_mode == "ขนาดมาก-น้อย":
+            tracks.sort(key=lambda t: t.get("file_size_mb", 0), reverse=True)
+
+        shown = len(tracks)
+        if query:
+            self.lib_count_label.configure(text=f"เพลง: {shown}/{total} เพลง")
+        else:
+            self.lib_count_label.configure(text=f"เพลง: {total} เพลง")
 
         if not tracks:
-            ctk.CTkLabel(self.lib_scroll, text="ยังไม่มีเพลง ลองดาวน์โหลดเพลงก่อน!",
+            msg = "ไม่พบเพลงที่ตรงกับคำค้นหา" if query else "ยังไม่มีเพลง ลองดาวน์โหลดเพลงก่อน!"
+            ctk.CTkLabel(self.lib_scroll, text=msg,
                          font=self._font(13)).pack(pady=20)
             return
 
@@ -1215,9 +1271,16 @@ class HookToShortApp(ctk.CTk):
         ctk.CTkLabel(gen_mode_frame, text="— เลือกเมื่อ Kie.ai เครดิตหมด",
                      font=self._font(11), text_color="gray").pack(side="left", padx=(6, 0))
 
-        # Generate button
-        self.generate_btn = ctk.CTkButton(tab, text="สร้างวิดีโอสั้น", width=180, font=self._font(14, "bold"), command=self._on_generate)
-        self.generate_btn.pack(pady=(4, 4))
+        # Generate buttons row
+        gen_btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        gen_btn_frame.pack(pady=(4, 4))
+        self.generate_btn = ctk.CTkButton(gen_btn_frame, text="สร้างวิดีโอสั้น (Ctrl+G)", width=200, font=self._font(14, "bold"), command=self._on_generate)
+        self.generate_btn.pack(side="left", padx=(0, 8))
+        self.batch_gen_btn = ctk.CTkButton(
+            gen_btn_frame, text="สร้างหลายเพลง", width=140, font=self._font(13),
+            fg_color="#8e44ad", hover_color="#9b59b6",
+            command=self._on_batch_generate)
+        self.batch_gen_btn.pack(side="left")
 
         # Progress
         self.gen_progress = ctk.CTkLabel(tab, text="", font=self._font(13), wraplength=700, justify="left")
@@ -1765,6 +1828,218 @@ class HookToShortApp(ctk.CTk):
             subprocess.Popen(["xdg-open", folder])
 
     # -----------------------------------------------------------------------
+    # Batch Video Generation
+    # -----------------------------------------------------------------------
+
+    def _on_batch_generate(self):
+        """Open a dialog to select multiple songs and generate videos for all."""
+        tracks = load_tracks()
+        if not tracks:
+            tkmessagebox.showinfo("คลังเพลงว่าง", "ยังไม่มีเพลง — ดาวน์โหลดเพลงก่อน")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("สร้างวิดีโอหลายเพลง")
+        dialog.geometry("520x480")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, True)
+
+        # Header
+        ctk.CTkLabel(dialog, text="เลือกเพลงที่ต้องการสร้างวิดีโอ",
+                     font=self._font(14, "bold")).pack(padx=12, pady=(12, 4))
+
+        # Select all toggle
+        top_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        top_row.pack(fill="x", padx=12, pady=(0, 4))
+        select_all_var = ctk.BooleanVar(value=False)
+
+        check_vars = []
+
+        def toggle_all():
+            val = select_all_var.get()
+            for v, _ in check_vars:
+                v.set(val)
+            update_count()
+
+        ctk.CTkCheckBox(top_row, text="เลือกทั้งหมด", variable=select_all_var,
+                        font=self._font(12), command=toggle_all).pack(side="left")
+
+        count_label = ctk.CTkLabel(top_row, text="เลือก 0 เพลง", font=self._font(12),
+                                   text_color="gray")
+        count_label.pack(side="right")
+
+        def update_count():
+            n = sum(1 for v, _ in check_vars if v.get())
+            count_label.configure(text=f"เลือก {n} เพลง")
+
+        # Song list
+        scroll = ctk.CTkScrollableFrame(dialog, height=220)
+        scroll.pack(fill="both", expand=True, padx=12, pady=4)
+
+        for track in tracks:
+            if not os.path.exists(track.get("file_path", "")):
+                continue
+            var = ctk.BooleanVar(value=False)
+            title = track.get("title", "?")
+            artist = track.get("artist", "ไม่ทราบ")
+            display = f"{title}  —  {artist}"
+            if len(display) > 60:
+                display = display[:57] + "..."
+            ctk.CTkCheckBox(scroll, text=display, variable=var,
+                            font=self._font(12),
+                            command=update_count).pack(fill="x", pady=1, anchor="w")
+            check_vars.append((var, track))
+
+        # Settings summary
+        settings_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        settings_frame.pack(fill="x", padx=12, pady=(4, 2))
+        ctk.CTkLabel(settings_frame, text=(
+            f"ตั้งค่า: {self.style_var.get()} | {self.platform_var.get()} | "
+            f"ฮุก {self.hook_length_var.get()} วิ. | {self.font_style_var.get()}"
+        ), font=self._font(11), text_color="gray").pack(anchor="w")
+
+        # Progress label
+        progress_label = ctk.CTkLabel(dialog, text="", font=self._font(12))
+        progress_label.pack(padx=12, pady=2)
+
+        # Progress bar
+        progress_bar = ctk.CTkProgressBar(dialog, width=400, height=14)
+        progress_bar.pack(padx=12, pady=(0, 4))
+        progress_bar.set(0)
+        progress_bar.pack_forget()
+
+        # Buttons row
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(padx=12, pady=(4, 12))
+
+        gen_btn = ctk.CTkButton(
+            btn_frame, text="สร้างวิดีโอ", width=140,
+            font=self._font(13, "bold"), command=lambda: start_batch())
+        gen_btn.pack(side="left", padx=(0, 8))
+
+        close_btn = ctk.CTkButton(
+            btn_frame, text="ปิด", width=80, font=self._font(13),
+            fg_color="#7f8c8d", hover_color="#95a5a6",
+            command=dialog.destroy)
+        close_btn.pack(side="left")
+
+        def start_batch():
+            selected = [(v, t) for v, t in check_vars if v.get()]
+            if not selected:
+                progress_label.configure(text="กรุณาเลือกอย่างน้อย 1 เพลง")
+                return
+
+            gen_btn.configure(state="disabled")
+            close_btn.configure(state="disabled")
+            progress_bar.set(0)
+            progress_bar.pack(padx=12, pady=(0, 4))
+
+            hook_length = self.hook_length_var.get()
+            platform = self._platform_key()
+            video_style = self.style_var.get()
+            font_style = self.font_style_var.get()
+            font_angle = self.font_angle_var.get()
+            gemini_only = self.gemini_only_var.get()
+            custom_prompt = self.prompt_textbox.get("1.0", "end").strip()
+
+            def batch_task():
+                total = len(selected)
+                success = 0
+                for idx, (_, track) in enumerate(selected):
+                    audio_path = track["file_path"]
+                    song_label = track.get("title", "?")
+
+                    def update_ui(i=idx, label=song_label):
+                        progress_label.configure(
+                            text=f"กำลังสร้าง {i + 1}/{total}: {label}")
+                        progress_bar.set((i) / total)
+                    dialog.after(0, update_ui)
+
+                    try:
+                        # Metadata
+                        filename = Path(audio_path).stem
+                        metadata = extract_metadata_from_title(filename)
+                        song_title = metadata["song"]
+                        artist = track.get("artist", "") or metadata["artist"]
+                        if artist == "ไม่ทราบ":
+                            artist = metadata["artist"]
+
+                        # Mood
+                        detector = MoodDetector()
+                        mood_info = detector.detect_from_artist_title(artist, song_title)
+                        mood = mood_info["mood"]
+                        intensity = mood_info["intensity"]
+
+                        # Hook
+                        hook_filename = f"{song_title.replace(' ', '_')}_hook_{hook_length}s.wav"
+                        hook_path = os.path.join(OUTPUTS_FOLDER, hook_filename)
+                        if not os.path.exists(hook_path):
+                            from python.main import extract_hook as _extract_hook
+                            tmp_hook = os.path.join(OUTPUTS_FOLDER, f"_tmp_hook_{int(datetime.now().timestamp())}.wav")
+                            if not _extract_hook(audio_path, tmp_hook, hook_length):
+                                if os.path.exists(tmp_hook):
+                                    os.remove(tmp_hook)
+                                logger.warning(f"Batch: hook extraction failed for {song_title}")
+                                continue
+                            os.replace(tmp_hook, hook_path)
+
+                        # Art
+                        art_filename = f"{song_title.replace(' ', '_')}_art.png"
+                        art_path = os.path.join(OUTPUTS_FOLDER, art_filename)
+                        image_path = None
+
+                        if not gemini_only:
+                            gen = KieAIGenerator()
+                            image_path = gen.generate_album_art(
+                                song_title=song_title, mood=mood, intensity=intensity,
+                                output_path=art_path, video_style=video_style,
+                                font_style=font_style, font_angle=font_angle,
+                                artist=artist, custom_prompt=custom_prompt)
+
+                        if not image_path:
+                            gemini_gen = GeminiImageGenerator()
+                            image_path = gemini_gen.generate_album_art(
+                                song_title=song_title, mood=mood, intensity=intensity,
+                                output_path=art_path, video_style=video_style,
+                                font_style=font_style, font_angle=font_angle,
+                                artist=artist, custom_prompt=custom_prompt)
+
+                        if not image_path:
+                            logger.warning(f"Batch: art generation failed for {song_title}")
+                            continue
+
+                        # Video
+                        video_filename = f"{song_title.replace(' ', '_')}_short.mp4"
+                        video_path = os.path.join(OUTPUTS_FOLDER, video_filename)
+                        vid = compose_complete_short(
+                            image_path=image_path, hook_audio_path=hook_path,
+                            output_path=video_path, song_title=song_title,
+                            platform=platform)
+                        if vid:
+                            success += 1
+                            logger.info(f"Batch: created {video_filename}")
+                        else:
+                            logger.warning(f"Batch: video composition failed for {song_title}")
+
+                    except Exception as e:
+                        logger.error(f"Batch: error for {song_label}: {e}")
+
+                _cleanup_temp_hooks()
+
+                def done():
+                    progress_bar.set(1.0)
+                    progress_label.configure(
+                        text=f"เสร็จ! สร้างสำเร็จ {success}/{total} วิดีโอ")
+                    gen_btn.configure(state="normal")
+                    close_btn.configure(state="normal")
+                    self._refresh_upload_videos()
+                    self.status_var.set(f"Batch: สร้างเสร็จ {success}/{total}")
+                dialog.after(0, done)
+
+            threading.Thread(target=batch_task, daemon=True).start()
+
+    # -----------------------------------------------------------------------
     # Upload Tab
     # -----------------------------------------------------------------------
 
@@ -1801,6 +2076,26 @@ class HookToShortApp(ctk.CTk):
 
         # Keep upload_video_var for compatibility (stores last/primary selection)
         self.upload_video_var = ctk.StringVar(value="")
+
+        # Template row
+        tpl_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        tpl_frame.pack(fill="x", padx=8, pady=(4, 2))
+        ctk.CTkLabel(tpl_frame, text="เทมเพลต:", font=self._font(13), width=80, anchor="w").pack(side="left")
+        self._tpl_var = ctk.StringVar(value="(ไม่ใช้)")
+        self._tpl_dropdown = ctk.CTkComboBox(
+            tpl_frame, variable=self._tpl_var,
+            values=["(ไม่ใช้)"], width=200, state="readonly",
+            font=self._font(12), command=self._on_load_template)
+        self._tpl_dropdown.pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            tpl_frame, text="บันทึก", width=60, font=self._font(12),
+            fg_color="#27ae60", hover_color="#1e8449",
+            command=self._on_save_template).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(
+            tpl_frame, text="ลบ", width=50, font=self._font(12),
+            fg_color="#c0392b", hover_color="#e74c3c",
+            command=self._on_delete_template).pack(side="left")
+        self._refresh_template_list()
 
         # Title
         title_frame = ctk.CTkFrame(tab, fg_color="transparent")
@@ -1931,7 +2226,7 @@ class HookToShortApp(ctk.CTk):
                         variable=self.auto_upload_var, font=self._font(12)).pack(side="left")
 
         # Upload button
-        self.upload_btn = ctk.CTkButton(tab, text="อัปโหลด", width=180,
+        self.upload_btn = ctk.CTkButton(tab, text="อัปโหลด (Ctrl+U)", width=200,
                                          font=self._font(14, "bold"), command=self._on_upload)
         self.upload_btn.pack(pady=(8, 4))
 
@@ -2411,6 +2706,87 @@ class HookToShortApp(ctk.CTk):
             self.upload_retry_btn.pack_forget()
 
         self.status_var.set(f"อัปโหลดเสร็จ — {success_count}/{total}")
+
+    # -----------------------------------------------------------------------
+    # Upload Templates
+    # -----------------------------------------------------------------------
+
+    def _refresh_template_list(self):
+        s = load_settings()
+        templates = s.get("upload_templates", {})
+        names = ["(ไม่ใช้)"] + sorted(templates.keys())
+        self._tpl_dropdown.configure(values=names)
+
+    def _on_save_template(self):
+        dialog = ctk.CTkInputDialog(text="ตั้งชื่อเทมเพลต:", title="บันทึกเทมเพลต")
+        name = dialog.get_input()
+        if not name or not name.strip():
+            return
+        name = name.strip()
+
+        tpl = {
+            "description": self.upload_desc_textbox.get("1.0", "end").strip(),
+            "tags": self.upload_tags_var.get(),
+            "promo_link": self.upload_promo_link_var.get(),
+            "publish_mode": self.upload_privacy_var.get(),
+            "youtube": self.upload_yt_var.get(),
+            "tiktok": self.upload_tt_var.get(),
+            "facebook": self.upload_fb_var.get(),
+        }
+
+        s = load_settings()
+        if "upload_templates" not in s:
+            s["upload_templates"] = {}
+        s["upload_templates"][name] = tpl
+        save_settings(s)
+
+        self._refresh_template_list()
+        self._tpl_var.set(name)
+        self.status_var.set(f"บันทึกเทมเพลต: {name}")
+
+    def _on_load_template(self, _value=None):
+        name = self._tpl_var.get()
+        if name == "(ไม่ใช้)":
+            return
+
+        s = load_settings()
+        tpl = s.get("upload_templates", {}).get(name)
+        if not tpl:
+            return
+
+        # Apply template values
+        self.upload_desc_textbox.delete("1.0", "end")
+        if tpl.get("description"):
+            self.upload_desc_textbox.insert("1.0", tpl["description"])
+        if "tags" in tpl:
+            self.upload_tags_var.set(tpl["tags"])
+        if "promo_link" in tpl:
+            self.upload_promo_link_var.set(tpl["promo_link"])
+        if "publish_mode" in tpl:
+            self.upload_privacy_var.set(tpl["publish_mode"])
+            self._on_publish_mode_changed()
+        if "youtube" in tpl:
+            self.upload_yt_var.set(tpl["youtube"])
+        if "tiktok" in tpl:
+            self.upload_tt_var.set(tpl["tiktok"])
+        if "facebook" in tpl:
+            self.upload_fb_var.set(tpl["facebook"])
+
+        self.status_var.set(f"โหลดเทมเพลต: {name}")
+
+    def _on_delete_template(self):
+        name = self._tpl_var.get()
+        if name == "(ไม่ใช้)":
+            return
+
+        s = load_settings()
+        templates = s.get("upload_templates", {})
+        if name in templates:
+            del templates[name]
+            save_settings(s)
+            self._refresh_template_list()
+            self._tpl_var.set("(ไม่ใช้)")
+            self.status_var.set(f"ลบเทมเพลต: {name}")
 
     # -----------------------------------------------------------------------
     # Settings Tab
