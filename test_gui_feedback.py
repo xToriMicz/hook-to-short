@@ -189,6 +189,79 @@ DOWNLOAD_TESTS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Batch result summary logic (mirrors _batch_done)
+# ---------------------------------------------------------------------------
+
+def get_batch_summary(success: int, total: int, failed_count: int) -> str:
+    """Simulate _batch_done() summary text."""
+    if failed_count > 0:
+        return f"เสร็จ! สำเร็จ {success}/{total} — ไม่สำเร็จ {failed_count} เพลง"
+    return f"เสร็จ! ดาวน์โหลดสำเร็จ {success}/{total} เพลง"
+
+
+def get_retry_button_text(failed_count: int) -> str:
+    """Return retry button label for N failures."""
+    return f"ลองใหม่ ({failed_count} เพลง)"
+
+
+def get_checkbox_text(index: int, title: str, status: str, error: str = None) -> str:
+    """Mirror _update_checkbox() formatting."""
+    num = index + 1
+    suffixes = {
+        "downloading": "(กำลังโหลด...)",
+        "success": "[สำเร็จ]",
+        "failed": f"[ไม่สำเร็จ — {(error or '')[:60]}]",
+    }
+    suffix = suffixes.get(status, "")
+    return f"{num}. {title}  {suffix}"
+
+
+BATCH_RESULT_TESTS = [
+    # (success, total, failed_count, expected_text, label)
+    (10, 10, 0,
+     "เสร็จ! ดาวน์โหลดสำเร็จ 10/10 เพลง",
+     "all success -> clean message"),
+
+    (8, 10, 2,
+     "เสร็จ! สำเร็จ 8/10 — ไม่สำเร็จ 2 เพลง",
+     "partial failure -> breakdown"),
+
+    (0, 5, 5,
+     "เสร็จ! สำเร็จ 0/5 — ไม่สำเร็จ 5 เพลง",
+     "all failed -> breakdown"),
+
+    (1, 1, 0,
+     "เสร็จ! ดาวน์โหลดสำเร็จ 1/1 เพลง",
+     "single video success"),
+]
+
+CHECKBOX_TEXT_TESTS = [
+    # (index, title, status, error, expected, label)
+    (0, "Song A", "downloading", None,
+     "1. Song A  (กำลังโหลด...)",
+     "downloading state"),
+
+    (2, "Song C", "success", None,
+     "3. Song C  [สำเร็จ]",
+     "success state"),
+
+    (4, "Song E", "failed", "yt-dlp error",
+     "5. Song E  [ไม่สำเร็จ — yt-dlp error]",
+     "failed state with error"),
+
+    (0, "Song F", "failed", "x" * 100,
+     f"1. Song F  [ไม่สำเร็จ — {'x' * 60}]",
+     "failed state with long error truncation"),
+]
+
+RETRY_BTN_TESTS = [
+    (2, "ลองใหม่ (2 เพลง)", "2 failures"),
+    (1, "ลองใหม่ (1 เพลง)", "1 failure"),
+    (10, "ลองใหม่ (10 เพลง)", "10 failures"),
+]
+
+
 def run_tests():
     passed = 0
     failed = 0
@@ -218,6 +291,45 @@ def run_tests():
             failed += 1
             print(f"  FAIL  {label}")
             print(f"        URL:      {url}")
+            print(f"        Expected: {expected_text}")
+            print(f"        Got:      {actual}")
+
+    print(f"\n=== Batch Result Summary Tests ===\n")
+    for success_n, total_n, failed_n, expected_text, label in BATCH_RESULT_TESTS:
+        actual = get_batch_summary(success_n, total_n, failed_n)
+        ok = actual == expected_text
+        if ok:
+            passed += 1
+            print(f"  PASS  {label}")
+        else:
+            failed += 1
+            print(f"  FAIL  {label}")
+            print(f"        Expected: {expected_text}")
+            print(f"        Got:      {actual}")
+
+    print(f"\n=== Checkbox Status Text Tests ===\n")
+    for idx, title, status, error, expected_text, label in CHECKBOX_TEXT_TESTS:
+        actual = get_checkbox_text(idx, title, status, error)
+        ok = actual == expected_text
+        if ok:
+            passed += 1
+            print(f"  PASS  {label}")
+        else:
+            failed += 1
+            print(f"  FAIL  {label}")
+            print(f"        Expected: {expected_text}")
+            print(f"        Got:      {actual}")
+
+    print(f"\n=== Retry Button Text Tests ===\n")
+    for count, expected_text, label in RETRY_BTN_TESTS:
+        actual = get_retry_button_text(count)
+        ok = actual == expected_text
+        if ok:
+            passed += 1
+            print(f"  PASS  {label}")
+        else:
+            failed += 1
+            print(f"  FAIL  {label}")
             print(f"        Expected: {expected_text}")
             print(f"        Got:      {actual}")
 

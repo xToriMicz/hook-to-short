@@ -471,6 +471,10 @@ class HookToShortApp(ctk.CTk):
                                               command=self._toggle_select_all)
         self.select_all_cb.pack(side="left")
 
+        self.retry_btn = ctk.CTkButton(ctrl_frame, text="ลองใหม่", width=130,
+                                        font=self._font(13), command=self._on_batch_retry)
+        # Initially hidden — shown after batch download with failures
+
         self.batch_dl_btn = ctk.CTkButton(ctrl_frame, text="ดาวน์โหลดที่เลือก", width=160,
                                            font=self._font(13), command=self._on_batch_download)
         self.batch_dl_btn.pack(side="right")
@@ -478,8 +482,7 @@ class HookToShortApp(ctk.CTk):
         self.channel_scroll = ctk.CTkScrollableFrame(tab, height=150)
         self.channel_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 4))
 
-        self._channel_vars = []
-        self._channel_videos = []
+        self._channel_items = []   # [{data, var, widget, status, error}, ...]
 
         self.batch_progress = ctk.CTkLabel(tab, text="", font=self._font(13))
         self.batch_progress.pack(anchor="w", padx=8, pady=(0, 4))
@@ -723,9 +726,11 @@ class HookToShortApp(ctk.CTk):
 
         for w in self.channel_scroll.winfo_children():
             w.destroy()
-        self._channel_vars = []
-        self._channel_videos = []
+        self._channel_items = []
         self.select_all_var.set(False)
+        # Hide retry button on fresh scan
+        if hasattr(self, "retry_btn"):
+            self.retry_btn.pack_forget()
 
         if error:
             self.batch_progress.configure(text=f"ผิดพลาด: {error}")
@@ -736,49 +741,69 @@ class HookToShortApp(ctk.CTk):
             self.batch_progress.configure(text="ไม่พบวิดีโอในช่อง")
             return
 
-        self._channel_videos = videos
         self.batch_progress.configure(text=f"พบ {len(videos)} วิดีโอ")
         self.status_var.set(f"สแกนเสร็จ — พบ {len(videos)} วิดีโอ")
 
         for i, vid in enumerate(videos):
             var = ctk.BooleanVar(value=False)
-            self._channel_vars.append(var)
-            ctk.CTkCheckBox(
+            cb = ctk.CTkCheckBox(
                 self.channel_scroll,
                 text=f"{i + 1}. {vid['title']}",
                 variable=var,
                 font=self._font(12),
-            ).pack(anchor="w", padx=4, pady=1)
+            )
+            cb.pack(anchor="w", padx=4, pady=1)
+            self._channel_items.append({
+                "data": vid,
+                "var": var,
+                "widget": cb,
+                "index": i,
+                "status": "pending",
+                "error": None,
+            })
 
     def _toggle_select_all(self):
         state = self.select_all_var.get()
-        for var in self._channel_vars:
-            var.set(state)
+        for item in self._channel_items:
+            item["var"].set(state)
 
     def _on_batch_download(self):
-        selected = [
-            self._channel_videos[i]
-            for i, var in enumerate(self._channel_vars)
-            if var.get()
-        ]
+        selected = [item for item in self._channel_items if item["var"].get()]
 
         if not selected:
             self.batch_progress.configure(text="กรุณาเลือกอย่างน้อย 1 วิดีโอ")
             return
 
+        self._run_batch_download(selected)
+
+    def _run_batch_download(self, items_to_download: list):
         self.scan_btn.configure(state="disabled")
         self.batch_dl_btn.configure(state="disabled")
-        total = len(selected)
+        if hasattr(self, "retry_btn"):
+            self.retry_btn.pack_forget()
+
+        total = len(items_to_download)
         self.batch_progress.configure(text=f"เริ่มดาวน์โหลด 0/{total}...")
         self.status_var.set(f"เริ่มดาวน์โหลด batch {total} เพลง...")
 
+        def _update_checkbox(item, suffix):
+            """Thread-safe checkbox text update."""
+            num = item["index"] + 1
+            title = item["data"]["title"]
+            item["widget"].configure(text=f"{num}. {title}  {suffix}")
+
         def task():
             success = 0
-            for idx, vid in enumerate(selected):
+            for idx, item in enumerate(items_to_download):
+                vid = item["data"]
                 video_url = f"https://www.youtube.com/watch?v={vid['id']}"
                 short_title = vid['title'][:40]
+
+                item["status"] = "pending"
+                item["error"] = None
                 self.after(0, lambda i=idx + 1, t=short_title, n=total:
                     self.batch_progress.configure(text=f"ดาวน์โหลด {i}/{n}... {t}"))
+                self.after(0, lambda it=item: _update_checkbox(it, "(กำลังโหลด...)"))
 
                 try:
                     temp_folder = os.path.join(DOWNLOADS_FOLDER, f"temp_{int(datetime.now().timestamp())}")
@@ -809,12 +834,21 @@ class HookToShortApp(ctk.CTk):
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
                     if result.returncode != 0:
-                        logger.warning(f"Batch skip: {vid['title']} — {result.stderr[:200]}")
+                        err_msg = result.stderr[:200].strip()
+                        logger.warning(f"Batch skip: {vid['title']} — {err_msg}")
+                        item["status"] = "failed"
+                        item["error"] = err_msg or "yt-dlp error"
+                        self.after(0, lambda it=item: _update_checkbox(
+                            it, f"[ไม่สำเร็จ — {it['error'][:60]}]"))
                         continue
 
                     mp3_files = [f for f in os.listdir(temp_folder) if f.endswith(".mp3")]
                     if not mp3_files:
                         logger.warning(f"Batch skip: {vid['title']} — ไม่พบไฟล์ MP3")
+                        item["status"] = "failed"
+                        item["error"] = "ไม่พบไฟล์ MP3"
+                        self.after(0, lambda it=item: _update_checkbox(
+                            it, f"[ไม่สำเร็จ — {it['error']}]"))
                         continue
 
                     mp3_file = mp3_files[0]
@@ -834,12 +868,19 @@ class HookToShortApp(ctk.CTk):
                         "duration": "0:00",
                     })
                     success += 1
+                    item["status"] = "success"
+                    self.after(0, lambda it=item: _update_checkbox(it, "[สำเร็จ]"))
 
                 except Exception as e:
-                    logger.warning(f"Batch skip: {vid['title']} — {e}")
+                    err_msg = str(e)
+                    logger.warning(f"Batch skip: {vid['title']} — {err_msg}")
+                    item["status"] = "failed"
+                    item["error"] = err_msg
+                    self.after(0, lambda it=item: _update_checkbox(
+                        it, f"[ไม่สำเร็จ — {it['error'][:60]}]"))
 
                 # Rate limit between downloads
-                if idx < len(selected) - 1:
+                if idx < len(items_to_download) - 1:
                     self.after(0, lambda i=idx + 1, n=total:
                         self.batch_progress.configure(
                             text=f"ดาวน์โหลด {i}/{n} เสร็จ (รอ 10 วิ. ก่อนเพลงถัดไป)"))
@@ -852,10 +893,33 @@ class HookToShortApp(ctk.CTk):
     def _batch_done(self, success: int, total: int):
         self.scan_btn.configure(state="normal")
         self.batch_dl_btn.configure(state="normal")
-        self.batch_progress.configure(text=f"เสร็จ! ดาวน์โหลดสำเร็จ {success}/{total} เพลง")
+
+        failed_count = sum(1 for item in self._channel_items if item["status"] == "failed")
+        if failed_count > 0:
+            self.batch_progress.configure(
+                text=f"เสร็จ! สำเร็จ {success}/{total} — ไม่สำเร็จ {failed_count} เพลง")
+            # Show retry button
+            if hasattr(self, "retry_btn"):
+                self.retry_btn.configure(text=f"ลองใหม่ ({failed_count} เพลง)")
+                self.retry_btn.pack(side="right", padx=(6, 0))
+        else:
+            self.batch_progress.configure(text=f"เสร็จ! ดาวน์โหลดสำเร็จ {success}/{total} เพลง")
+            if hasattr(self, "retry_btn"):
+                self.retry_btn.pack_forget()
+
         self.status_var.set(f"Batch เสร็จ — {success}/{total} เพลง")
         self._refresh_library()
         self._refresh_track_dropdown()
+
+    def _on_batch_retry(self):
+        failed_items = [item for item in self._channel_items if item["status"] == "failed"]
+        if not failed_items:
+            return
+        # Reset failed items
+        for item in failed_items:
+            item["status"] = "pending"
+            item["error"] = None
+        self._run_batch_download(failed_items)
 
     # -----------------------------------------------------------------------
     # Library Tab
