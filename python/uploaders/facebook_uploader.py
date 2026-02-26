@@ -148,15 +148,22 @@ class FacebookUploader:
 
         # Step 3: Finish — publish the reel
         try:
+            finish_body = {
+                "upload_phase": "finish",
+                "video_id": video_id,
+                "title": request.title[:255],
+                "description": description[:5000],
+            }
+            # Facebook scheduling: pass unix timestamp
+            if request.publish_at:
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(request.publish_at)
+                finish_body["scheduled_publish_time"] = int(dt.timestamp())
+
             finish_resp = requests.post(
                 f"{GRAPH_API_BASE}/{self.page_id}/video_reels",
                 params={"access_token": self.access_token},
-                json={
-                    "upload_phase": "finish",
-                    "video_id": video_id,
-                    "title": request.title[:255],
-                    "description": description[:5000],
-                },
+                json=finish_body,
                 timeout=30,
             )
             finish_data = finish_resp.json()

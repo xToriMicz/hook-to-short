@@ -54,7 +54,10 @@ from python.mood_detector import MoodDetector, extract_metadata_from_title
 from python.kie_generator import KieAIGenerator
 from python.gemini_generator import GeminiImageGenerator
 from python.video_composer import VideoComposer, compose_complete_short
-from python.uploaders import UploadRequest, UploadResult, UploadStatus, get_output_videos, upload_with_retry
+from python.uploaders import (
+    UploadRequest, UploadResult, UploadStatus, get_output_videos, upload_with_retry,
+    PUBLISH_MODES, calculate_publish_time,
+)
 from python.uploaders.youtube_uploader import YouTubeUploader
 from python.uploaders.tiktok_browser import TikTokBrowserUploader
 from python.uploaders.facebook_uploader import FacebookUploader
@@ -111,6 +114,63 @@ def add_track(track_info: dict) -> dict:
     tracks.append(track_info)
     save_tracks(tracks)
     return track_info
+
+
+def sync_tracks_with_folder():
+    """Sync tracks.json with actual MP3 files in the downloads folder.
+
+    - New MP3 files found on disk → added to tracks.json automatically
+    - Tracked files that no longer exist → removed from tracks.json
+    - Existing files whose name changed externally → title updated
+    """
+    tracks = load_tracks()
+    mp3_files = glob_mod.glob(os.path.join(DOWNLOADS_FOLDER, "*.mp3"))
+    mp3_norm_set = {os.path.normpath(f) for f in mp3_files}
+    tracked_norm_set = {os.path.normpath(t.get("file_path", "")) for t in tracks}
+
+    changed = False
+
+    # Keep only tracks whose files still exist on disk
+    surviving = []
+    for t in tracks:
+        norm = os.path.normpath(t.get("file_path", ""))
+        if norm in mp3_norm_set:
+            # Update title/filename if file was renamed externally
+            current_stem = Path(norm).stem
+            if t.get("title") != current_stem:
+                t["title"] = current_stem
+                t["filename"] = os.path.basename(norm)
+                t["file_path"] = os.path.join(DOWNLOADS_FOLDER, os.path.basename(norm))
+                changed = True
+            surviving.append(t)
+        else:
+            changed = True  # file gone → drop track
+
+    # Add new MP3 files not yet tracked
+    max_id = max((t.get("id", 0) for t in surviving), default=0)
+    for mp3_path in mp3_files:
+        norm = os.path.normpath(mp3_path)
+        if norm not in tracked_norm_set:
+            max_id += 1
+            file_size = os.path.getsize(mp3_path) / (1024 * 1024)
+            surviving.append({
+                "id": max_id,
+                "title": Path(mp3_path).stem,
+                "youtube_url": "",
+                "file_path": mp3_path,
+                "filename": os.path.basename(mp3_path),
+                "file_size_mb": round(file_size, 2),
+                "artist": "ไม่ทราบ",
+                "duration": "0:00",
+                "created_at": datetime.now().isoformat(),
+                "status": "completed",
+            })
+            changed = True
+
+    if changed:
+        save_tracks(surviving)
+
+    return surviving
 
 
 def _cleanup_temp_hooks():
@@ -321,7 +381,10 @@ class HookToShortApp(ctk.CTk):
         if "upload_tags" in s:
             self.upload_tags_var.set(s["upload_tags"])
         if "upload_privacy" in s:
-            self.upload_privacy_var.set(s["upload_privacy"])
+            saved = s["upload_privacy"]
+            # Migrate old values (public/private/unlisted) to new labels
+            migrate = {"public": "โพสทันที", "private": "ส่วนตัว", "unlisted": "ไม่แสดง"}
+            self.upload_privacy_var.set(migrate.get(saved, saved))
         if "auto_upload" in s:
             self.auto_upload_var.set(s["auto_upload"])
         if "gemini_only" in s:
@@ -734,6 +797,13 @@ class HookToShortApp(ctk.CTk):
         refresh_btn = ctk.CTkButton(top_bar, text="รีเฟรช", width=80, font=self._font(13), command=self._refresh_library)
         refresh_btn.pack(side="right")
 
+        open_folder_btn = ctk.CTkButton(
+            top_bar, text="เปิดโฟลเดอร์", width=100, font=self._font(13),
+            fg_color="#7f8c8d", hover_color="#95a5a6",
+            command=lambda: os.startfile(os.path.abspath(DOWNLOADS_FOLDER)),
+        )
+        open_folder_btn.pack(side="right", padx=(0, 4))
+
         self.lib_scroll = ctk.CTkScrollableFrame(tab)
         self.lib_scroll.pack(fill="both", expand=True, padx=8, pady=4)
 
@@ -743,7 +813,7 @@ class HookToShortApp(ctk.CTk):
         for widget in self.lib_scroll.winfo_children():
             widget.destroy()
 
-        tracks = load_tracks()
+        tracks = sync_tracks_with_folder()
         self.lib_count_label.configure(text=f"เพลง: {len(tracks)} เพลง")
 
         if not tracks:
@@ -780,13 +850,70 @@ class HookToShortApp(ctk.CTk):
             )
             del_btn.pack(side="right", padx=4, pady=4)
 
+            rename_btn = ctk.CTkButton(
+                row, text="แก้ชื่อ", width=70, fg_color="#2980b9", hover_color="#3498db",
+                font=self._font(13),
+                command=lambda tid=track_id: self._rename_track(tid),
+            )
+            rename_btn.pack(side="right", padx=(4, 0), pady=4)
+
     def _delete_track(self, track_id):
         tracks = load_tracks()
+        track = next((t for t in tracks if t.get("id") == track_id), None)
+        if track:
+            # Delete the MP3 file from disk too
+            try:
+                fp = track.get("file_path", "")
+                if os.path.exists(fp):
+                    os.remove(fp)
+            except OSError:
+                pass
         tracks = [t for t in tracks if t.get("id") != track_id]
         save_tracks(tracks)
         self._refresh_library()
         self._refresh_track_dropdown()
         self.status_var.set(f"ลบเพลง #{track_id} แล้ว")
+
+    def _rename_track(self, track_id):
+        tracks = load_tracks()
+        track = next((t for t in tracks if t.get("id") == track_id), None)
+        if not track:
+            return
+
+        old_title = track.get("title", "")
+        dialog = ctk.CTkInputDialog(
+            text=f"ชื่อปัจจุบัน: {old_title}\n\nใส่ชื่อใหม่:",
+            title="แก้ชื่อเพลง",
+        )
+        new_title = dialog.get_input()
+
+        if not new_title or not new_title.strip() or new_title.strip() == old_title:
+            return
+
+        new_title = new_title.strip()
+        safe_name = self._sanitize_filename(new_title) + ".mp3"
+        old_path = track["file_path"]
+        new_path = os.path.join(DOWNLOADS_FOLDER, safe_name)
+
+        if os.path.normpath(old_path) != os.path.normpath(new_path) and os.path.exists(new_path):
+            self.status_var.set(f"ไฟล์ชื่อ {safe_name} มีอยู่แล้ว!")
+            return
+
+        try:
+            if os.path.exists(old_path):
+                os.rename(old_path, new_path)
+        except OSError as e:
+            self.status_var.set(f"เปลี่ยนชื่อไม่สำเร็จ: {e}")
+            return
+
+        track["title"] = new_title
+        track["filename"] = safe_name
+        track["file_path"] = new_path
+        save_tracks(tracks)
+
+        self._refresh_library()
+        self._refresh_track_dropdown()
+        self.status_var.set(f"เปลี่ยนชื่อเป็น: {new_title}")
 
     # -----------------------------------------------------------------------
     # Create Short Tab
@@ -1217,7 +1344,7 @@ class HookToShortApp(ctk.CTk):
 
         tags_raw = self.upload_tags_var.get().strip()
         tags = [t.strip().replace("#", "") for t in tags_raw.split(",") if t.strip()]
-        privacy = self.upload_privacy_var.get()
+        publish_mode = self.upload_privacy_var.get()
         promo_link = self.upload_promo_link_var.get().strip()
         auto_desc = promo_link if promo_link else ""
         fname = os.path.basename(video_path)
@@ -1226,7 +1353,7 @@ class HookToShortApp(ctk.CTk):
         self.status_var.set("อัปโหลดอัตโนมัติ...")
 
         def task():
-            results = self._upload_single(video_path, title, auto_desc, tags, privacy, platforms,
+            results = self._upload_single(video_path, title, auto_desc, tags, publish_mode, platforms,
                                           step_prefix="[auto] ")
             add_upload_record(fname, results)
             success = sum(1 for r in results if r.status == UploadStatus.SUCCESS)
@@ -1282,6 +1409,12 @@ class HookToShortApp(ctk.CTk):
         ctk.CTkButton(sel_header, text="รีเฟรช", width=70, font=self._font(12),
                        command=self._refresh_upload_videos).pack(side="right")
 
+        ctk.CTkButton(
+            sel_header, text="เปิดโฟลเดอร์", width=100, font=self._font(12),
+            fg_color="#7f8c8d", hover_color="#95a5a6",
+            command=lambda: os.startfile(os.path.abspath(OUTPUTS_FOLDER)),
+        ).pack(side="right", padx=(0, 4))
+
         self._upload_video_list_frame = ctk.CTkScrollableFrame(tab, height=80)
         self._upload_video_list_frame.pack(fill="x", padx=8, pady=(0, 4))
         self._upload_video_checks: list[tuple[ctk.BooleanVar, str]] = []  # (var, filename)
@@ -1325,14 +1458,17 @@ class HookToShortApp(ctk.CTk):
         ctk.CTkEntry(link_frame, textvariable=self.upload_promo_link_var, font=self._font(13),
                      placeholder_text="เช่น Spotify, YouTube, เว็บไซต์").pack(side="left", fill="x", expand=True)
 
-        # Privacy
+        # Publish mode (privacy + scheduling)
         priv_frame = ctk.CTkFrame(tab, fg_color="transparent")
         priv_frame.pack(fill="x", padx=8, pady=2)
-        ctk.CTkLabel(priv_frame, text="ความเป็นส่วนตัว:", font=self._font(13), width=120, anchor="w").pack(side="left")
-        self.upload_privacy_var = ctk.StringVar(value="public")
+        ctk.CTkLabel(priv_frame, text="เผยแพร่:", font=self._font(13), width=120, anchor="w").pack(side="left")
+        self.upload_privacy_var = ctk.StringVar(value="โพสทันที")
         ctk.CTkComboBox(priv_frame, variable=self.upload_privacy_var,
-                        values=["public", "private", "unlisted"],
-                        width=140, state="readonly", font=self._font(13)).pack(side="left")
+                        values=list(PUBLISH_MODES.keys()),
+                        width=180, state="readonly", font=self._font(13),
+                        command=self._on_publish_mode_changed).pack(side="left")
+        self.schedule_info_label = ctk.CTkLabel(priv_frame, text="", font=self._font(11), text_color="#3498db")
+        self.schedule_info_label.pack(side="left", padx=(8, 0))
 
         # Platform toggles
         plat_frame = ctk.CTkFrame(tab)
@@ -1460,7 +1596,8 @@ class HookToShortApp(ctk.CTk):
             var = ctk.BooleanVar(value=False)
             row = ctk.CTkFrame(self._upload_video_list_frame, fg_color="transparent")
             row.pack(fill="x", pady=1)
-            ctk.CTkCheckBox(row, text=f"{vid['filename']}  ({vid['size_mb']} MB)",
+            date_str = vid.get('date', '')
+            ctk.CTkCheckBox(row, text=f"{vid['filename']}  ({vid['size_mb']} MB)  {date_str}",
                             variable=var, font=self._font(11),
                             command=self._on_video_check_changed).pack(side="left")
             self._upload_video_checks.append((var, vid["filename"]))
@@ -1475,6 +1612,49 @@ class HookToShortApp(ctk.CTk):
         for var, _ in self._upload_video_checks:
             var.set(val)
         self._on_video_check_changed()
+
+    def _on_publish_mode_changed(self, _value=None):
+        """Update schedule info label when publish mode changes."""
+        import random as _rnd
+        mode = self.upload_privacy_var.get()
+        days = PUBLISH_MODES.get(mode)
+        if days is None:
+            self.schedule_info_label.configure(text="")
+        else:
+            if days == -1:  # random
+                days = _rnd.randint(1, 3)
+            sample = calculate_publish_time("youtube", days)
+            # Show just date + time in a friendly format
+            from datetime import datetime as _dt
+            dt = _dt.fromisoformat(sample)
+            self.schedule_info_label.configure(
+                text=f"ประมาณ {dt.strftime('%d/%m %H:%M')} (เวลาจะสุ่มตาม platform)")
+
+    @staticmethod
+    def _resolve_privacy_and_schedule(mode: str, platform: str, batch_offset: int = 0):
+        """Resolve publish mode → (privacy, publish_at) per platform.
+
+        Args:
+            mode: Value from the publish mode dropdown
+            platform: "youtube", "tiktok", or "facebook"
+            batch_offset: Extra days to add for batch (video index)
+
+        Returns:
+            (privacy_str, publish_at_iso_or_None)
+        """
+        import random as _rnd
+        days = PUBLISH_MODES.get(mode)
+        if days is None:
+            # Non-scheduled modes
+            privacy_map = {"โพสทันที": "public", "ส่วนตัว": "private", "ไม่แสดง": "unlisted"}
+            return privacy_map.get(mode, "public"), None
+
+        # Scheduled mode
+        if days == -1:  # random 1-3
+            days = _rnd.randint(1, 3)
+        days += batch_offset
+        publish_at = calculate_publish_time(platform, days)
+        return "public", publish_at
 
     def _on_video_check_changed(self):
         selected = [(var, fname) for var, fname in self._upload_video_checks if var.get()]
@@ -1556,57 +1736,74 @@ class HookToShortApp(ctk.CTk):
         self.after(0, lambda p=progress: self.upload_progress_bar.set(p))
 
     def _upload_single(self, video_path: str, title: str, description: str,
-                       tags: list[str], privacy: str, platforms: list[str],
-                       step_prefix: str = "") -> list[UploadResult]:
+                       tags: list[str], publish_mode: str, platforms: list[str],
+                       step_prefix: str = "",
+                       batch_offset: int = 0) -> list[UploadResult]:
         """Upload one video to selected platforms. Called from background thread.
 
         Note: Facebook & YouTube use title only (no description/promo link).
         TikTok gets the full description with promo link.
         """
-        # TikTok: full description (with promo link)
-        tiktok_request = UploadRequest(
-            video_path=video_path,
-            title=title,
-            description=description,
-            tags=tags,
-            privacy=privacy,
-        )
-        # Facebook & YouTube: title only — promo link & description ใช้ไม่ได้
-        title_only_request = UploadRequest(
-            video_path=video_path,
-            title=title,
-            description="",
-            tags=tags,
-            privacy=privacy,
-        )
         results = []
         total = len(platforms)
         for idx, platform in enumerate(platforms):
             step = f"{step_prefix}({idx + 1}/{total})"
             # Reset progress bar for each platform
             self.after(0, lambda: self.upload_progress_bar.set(0))
+
+            # Resolve privacy + schedule per platform
+            privacy, publish_at = self._resolve_privacy_and_schedule(
+                publish_mode, platform, batch_offset)
+
+            schedule_note = ""
+            if publish_at:
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(publish_at)
+                schedule_note = f" (ตั้งเวลา {dt.strftime('%d/%m %H:%M')})"
+
+            # TikTok: ignore scheduling (browser automation can't schedule)
+            if platform == "tiktok" and publish_at:
+                publish_at = None
+                privacy = "public"
+                schedule_note = " (TikTok: โพสทันที)"
+
+            # Build request per platform
+            if platform == "tiktok":
+                req = UploadRequest(
+                    video_path=video_path, title=title,
+                    description=description, tags=tags,
+                    privacy=privacy, publish_at=publish_at,
+                )
+            else:
+                # Facebook & YouTube: title only
+                req = UploadRequest(
+                    video_path=video_path, title=title,
+                    description="", tags=tags,
+                    privacy=privacy, publish_at=publish_at,
+                )
+
+            plat_name = {"youtube": "YouTube", "tiktok": "TikTok", "facebook": "Facebook"}.get(platform, platform)
+            self._upload_step(f"{step} {plat_name}: กำลังอัปโหลด...{schedule_note}")
+
             if platform == "youtube":
-                self._upload_step(f"{step} YouTube: กำลังอัปโหลด...")
                 yt = YouTubeUploader()
                 result = upload_with_retry(
-                    lambda: yt.upload(title_only_request, progress_callback=self._upload_progress_callback))
-                results.append(result)
+                    lambda: yt.upload(req, progress_callback=self._upload_progress_callback))
             elif platform == "tiktok":
-                self._upload_step(f"{step} TikTok: กำลังอัปโหลด...")
                 tt = TikTokBrowserUploader()
                 result = upload_with_retry(
-                    lambda: tt.upload(tiktok_request, progress_callback=self._upload_progress_callback))
-                results.append(result)
+                    lambda: tt.upload(req, progress_callback=self._upload_progress_callback))
             elif platform == "facebook":
-                self._upload_step(f"{step} Facebook: กำลังอัปโหลด...")
                 s = load_settings()
                 fb = FacebookUploader(
                     page_id=s.get("facebook_page_id", ""),
                     access_token=s.get("facebook_access_token", ""),
                 )
                 result = upload_with_retry(
-                    lambda: fb.upload(title_only_request, progress_callback=self._upload_progress_callback))
-                results.append(result)
+                    lambda: fb.upload(req, progress_callback=self._upload_progress_callback))
+            else:
+                continue
+            results.append(result)
         return results
 
     def _on_upload(self):
@@ -1662,7 +1859,7 @@ class HookToShortApp(ctk.CTk):
             description = f"{description}\n{promo_link}" if description else promo_link
         tags_raw = self.upload_tags_var.get().strip()
         tags = [t.strip().replace("#", "") for t in tags_raw.split(",") if t.strip()]
-        privacy = self.upload_privacy_var.get()
+        publish_mode = self.upload_privacy_var.get()
 
         self.upload_btn.configure(state="disabled")
         self.upload_result_frame.pack_forget()
@@ -1686,8 +1883,12 @@ class HookToShortApp(ctk.CTk):
                     title = custom_title or fname.replace("_short.mp4", "").replace("_", " ")
                     prefix = ""
 
+                # Batch: auto-space schedule (+1 day per video)
+                batch_offset = vid_idx if is_batch else 0
+
                 results = self._upload_single(video_path, title, description,
-                                              tags, privacy, platforms, prefix)
+                                              tags, publish_mode, platforms, prefix,
+                                              batch_offset=batch_offset)
                 # Save history per video
                 self.after(0, lambda f=fname, r=list(results): add_upload_record(f, r))
                 all_results.extend(results)

@@ -128,6 +128,15 @@ class YouTubeUploader:
         if "#Shorts" not in description:
             description += "\n#Shorts"
 
+        status_body = {
+            "privacyStatus": request.privacy,
+            "selfDeclaredMadeForKids": False,
+        }
+        # YouTube scheduling: privacy must be "private" + publishAt in ISO 8601
+        if request.publish_at:
+            status_body["privacyStatus"] = "private"
+            status_body["publishAt"] = request.publish_at
+
         body = {
             "snippet": {
                 "title": title[:100],  # YouTube max 100 chars
@@ -135,10 +144,7 @@ class YouTubeUploader:
                 "tags": request.tags or [],
                 "categoryId": "10",  # Music
             },
-            "status": {
-                "privacyStatus": request.privacy,
-                "selfDeclaredMadeForKids": False,
-            },
+            "status": status_body,
         }
 
         media = MediaFileUpload(
