@@ -602,8 +602,10 @@ class HookToShortApp(ctk.CTk):
     def _classify_url(url: str):
         """Classify a YouTube URL into (type, clean_url).
 
+        Supports: youtube.com, music.youtube.com, youtu.be, /shorts/, /live/
+
         Returns one of:
-        - ("video", url)     — single video, no playlist
+        - ("video", url)     — single video, short, or live stream
         - ("playlist", url)  — playlist or watch?v=...&list=...
         - ("releases", url)  — channel releases tab
         - ("channel", url)   — channel (appends /videos if needed)
@@ -626,6 +628,14 @@ class HookToShortApp(ctk.CTk):
         if parsed.hostname in ('youtu.be', 'www.youtu.be'):
             if 'list' in qs:
                 return ("playlist", url)
+            return ("video", url)
+
+        # Shorts: /shorts/<id>
+        if re.search(r'/shorts/[A-Za-z0-9_-]+$', path):
+            return ("video", url)
+
+        # Live: /live/<id>
+        if re.search(r'/live/[A-Za-z0-9_-]+$', path):
             return ("video", url)
 
         # Channel with /releases tab
