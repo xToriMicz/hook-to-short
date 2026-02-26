@@ -622,6 +622,12 @@ class HookToShortApp(ctk.CTk):
                 return ("playlist", url)
             return ("video", url)
 
+        # Short URL: youtu.be/<id>
+        if parsed.hostname in ('youtu.be', 'www.youtu.be'):
+            if 'list' in qs:
+                return ("playlist", url)
+            return ("video", url)
+
         # Channel with /releases tab
         if re.search(r'/@[^/]+/releases$', path):
             return ("releases", url)
