@@ -217,6 +217,44 @@ def get_checkbox_text(index: int, title: str, status: str, error: str = None) ->
     return f"{num}. {title}  {suffix}"
 
 
+def get_checkbox_color(status: str) -> str:
+    """Mirror _update_checkbox() color logic."""
+    colors = {
+        "downloading": "#dce4ee",  # default/neutral
+        "success": "#2ecc71",      # green
+        "failed": "#e74c3c",       # red
+    }
+    return colors.get(status, "")
+
+
+# ---------------------------------------------------------------------------
+# Custom schedule validation (mirrors _parse_custom_schedule)
+# ---------------------------------------------------------------------------
+
+def validate_custom_schedule(date_str: str, time_str: str):
+    """Mirror _parse_custom_schedule() validation.
+
+    Returns parsed datetime on success, raises ValueError on failure.
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    ict = _tz(_td(hours=7))
+
+    if not date_str or not time_str:
+        raise ValueError("กรุณากรอกวันที่และเวลา")
+
+    try:
+        dt = _dt.strptime(f"{date_str} {time_str}", "%d/%m/%Y %H:%M")
+    except ValueError:
+        raise ValueError("รูปแบบไม่ถูกต้อง (DD/MM/YYYY HH:MM)")
+
+    dt = dt.replace(tzinfo=ict)
+
+    if dt <= _dt.now(ict):
+        raise ValueError("เวลาต้องเป็นอนาคต")
+
+    return dt
+
+
 BATCH_RESULT_TESTS = [
     # (success, total, failed_count, expected_text, label)
     (10, 10, 0,
@@ -259,6 +297,31 @@ RETRY_BTN_TESTS = [
     (2, "ลองใหม่ (2 เพลง)", "2 failures"),
     (1, "ลองใหม่ (1 เพลง)", "1 failure"),
     (10, "ลองใหม่ (10 เพลง)", "10 failures"),
+]
+
+# Color coding tests: (status, expected_color, label)
+COLOR_TESTS = [
+    ("downloading", "#dce4ee", "downloading -> neutral color"),
+    ("success", "#2ecc71", "success -> green"),
+    ("failed", "#e74c3c", "failed -> red"),
+]
+
+# Custom schedule validation tests: (date, time, should_pass, label)
+SCHEDULE_TESTS = [
+    # Format validation
+    ("", "19:00", False, "empty date -> error"),
+    ("27/02/2026", "", False, "empty time -> error"),
+    ("", "", False, "both empty -> error"),
+    ("2026-02-27", "19:00", False, "wrong date format (YYYY-MM-DD) -> error"),
+    ("27/02/2026", "7pm", False, "wrong time format (7pm) -> error"),
+    ("32/02/2026", "19:00", False, "invalid day 32 -> error"),
+    ("27/13/2026", "19:00", False, "invalid month 13 -> error"),
+    ("27/02/2026", "25:00", False, "invalid hour 25 -> error"),
+    # Past date (using a date that's definitely in the past)
+    ("01/01/2020", "12:00", False, "past date -> error"),
+    # Future date (using a date far in the future)
+    ("01/01/2030", "19:00", True, "future date -> OK"),
+    ("15/06/2028", "08:30", True, "another future date -> OK"),
 ]
 
 
@@ -332,6 +395,41 @@ def run_tests():
             print(f"  FAIL  {label}")
             print(f"        Expected: {expected_text}")
             print(f"        Got:      {actual}")
+
+    print(f"\n=== Checkbox Color Tests ===\n")
+    for status, expected_color, label in COLOR_TESTS:
+        actual = get_checkbox_color(status)
+        ok = actual == expected_color
+        if ok:
+            passed += 1
+            print(f"  PASS  {label}")
+        else:
+            failed += 1
+            print(f"  FAIL  {label}")
+            print(f"        Expected: {expected_color}")
+            print(f"        Got:      {actual}")
+
+    print(f"\n=== Custom Schedule Validation Tests ===\n")
+    for date_str, time_str, should_pass, label in SCHEDULE_TESTS:
+        try:
+            validate_custom_schedule(date_str, time_str)
+            ok = should_pass
+            if ok:
+                passed += 1
+                print(f"  PASS  {label}")
+            else:
+                failed += 1
+                print(f"  FAIL  {label}")
+                print(f"        Expected error but got success")
+        except ValueError as e:
+            ok = not should_pass
+            if ok:
+                passed += 1
+                print(f"  PASS  {label} (error: {e})")
+            else:
+                failed += 1
+                print(f"  FAIL  {label}")
+                print(f"        Expected success but got: {e}")
 
     print(f"\n{'='*50}")
     print(f"Results: {passed} passed, {failed} failed, {passed + failed} total")

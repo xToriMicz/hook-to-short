@@ -56,7 +56,7 @@ PEAK_HOURS: dict[str, list[tuple[int, int]]] = {
     "facebook": [(12, 14), (18, 20)],
 }
 
-# Publish mode labels → days offset (None = not scheduled)
+# Publish mode labels → days offset (None = not scheduled, -2 = custom datetime)
 PUBLISH_MODES: dict[str, Optional[int]] = {
     "โพสทันที":        None,
     "ส่วนตัว":         None,
@@ -65,6 +65,7 @@ PUBLISH_MODES: dict[str, Optional[int]] = {
     "ตั้งเวลา +2 วัน":  2,
     "ตั้งเวลา +3 วัน":  3,
     "สุ่ม 1-3 วัน":     -1,   # sentinel: random 1-3
+    "กำหนดเอง...":     -2,   # sentinel: custom date+time picker
 }
 
 

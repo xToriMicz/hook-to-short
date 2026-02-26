@@ -483,6 +483,7 @@ class HookToShortApp(ctk.CTk):
         self.channel_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 4))
 
         self._channel_items = []   # [{data, var, widget, status, error}, ...]
+        self._batch_running = False
 
         self.batch_progress = ctk.CTkLabel(tab, text="", font=self._font(13))
         self.batch_progress.pack(anchor="w", padx=8, pady=(0, 4))
@@ -660,6 +661,8 @@ class HookToShortApp(ctk.CTk):
         return ("channel", url.rstrip('/') + '/videos')
 
     def _on_scan_channel(self):
+        if self._batch_running:
+            return
         channel_url = self.channel_url_entry.get().strip()
         if not channel_url:
             self.batch_progress.configure(text="กรุณาใส่ลิงก์ช่อง / playlist / releases")
@@ -777,6 +780,7 @@ class HookToShortApp(ctk.CTk):
         self._run_batch_download(selected)
 
     def _run_batch_download(self, items_to_download: list):
+        self._batch_running = True
         self.scan_btn.configure(state="disabled")
         self.batch_dl_btn.configure(state="disabled")
         if hasattr(self, "retry_btn"):
@@ -786,11 +790,13 @@ class HookToShortApp(ctk.CTk):
         self.batch_progress.configure(text=f"เริ่มดาวน์โหลด 0/{total}...")
         self.status_var.set(f"เริ่มดาวน์โหลด batch {total} เพลง...")
 
-        def _update_checkbox(item, suffix):
-            """Thread-safe checkbox text update."""
+        def _update_checkbox(item, suffix, color=None):
+            """Thread-safe checkbox text update with optional color."""
             num = item["index"] + 1
             title = item["data"]["title"]
             item["widget"].configure(text=f"{num}. {title}  {suffix}")
+            if color:
+                item["widget"].configure(text_color=color)
 
         def task():
             success = 0
@@ -803,7 +809,7 @@ class HookToShortApp(ctk.CTk):
                 item["error"] = None
                 self.after(0, lambda i=idx + 1, t=short_title, n=total:
                     self.batch_progress.configure(text=f"ดาวน์โหลด {i}/{n}... {t}"))
-                self.after(0, lambda it=item: _update_checkbox(it, "(กำลังโหลด...)"))
+                self.after(0, lambda it=item: _update_checkbox(it, "(กำลังโหลด...)", "#dce4ee"))
 
                 try:
                     temp_folder = os.path.join(DOWNLOADS_FOLDER, f"temp_{int(datetime.now().timestamp())}")
@@ -839,7 +845,7 @@ class HookToShortApp(ctk.CTk):
                         item["status"] = "failed"
                         item["error"] = err_msg or "yt-dlp error"
                         self.after(0, lambda it=item: _update_checkbox(
-                            it, f"[ไม่สำเร็จ — {it['error'][:60]}]"))
+                            it, f"[ไม่สำเร็จ — {it['error'][:60]}]", "#e74c3c"))
                         continue
 
                     mp3_files = [f for f in os.listdir(temp_folder) if f.endswith(".mp3")]
@@ -848,7 +854,7 @@ class HookToShortApp(ctk.CTk):
                         item["status"] = "failed"
                         item["error"] = "ไม่พบไฟล์ MP3"
                         self.after(0, lambda it=item: _update_checkbox(
-                            it, f"[ไม่สำเร็จ — {it['error']}]"))
+                            it, f"[ไม่สำเร็จ — {it['error']}]", "#e74c3c"))
                         continue
 
                     mp3_file = mp3_files[0]
@@ -869,7 +875,7 @@ class HookToShortApp(ctk.CTk):
                     })
                     success += 1
                     item["status"] = "success"
-                    self.after(0, lambda it=item: _update_checkbox(it, "[สำเร็จ]"))
+                    self.after(0, lambda it=item: _update_checkbox(it, "[สำเร็จ]", "#2ecc71"))
 
                 except Exception as e:
                     err_msg = str(e)
@@ -877,7 +883,7 @@ class HookToShortApp(ctk.CTk):
                     item["status"] = "failed"
                     item["error"] = err_msg
                     self.after(0, lambda it=item: _update_checkbox(
-                        it, f"[ไม่สำเร็จ — {it['error'][:60]}]"))
+                        it, f"[ไม่สำเร็จ — {it['error'][:60]}]", "#e74c3c"))
 
                 # Rate limit between downloads
                 if idx < len(items_to_download) - 1:
@@ -891,6 +897,7 @@ class HookToShortApp(ctk.CTk):
         threading.Thread(target=task, daemon=True).start()
 
     def _batch_done(self, success: int, total: int):
+        self._batch_running = False
         self.scan_btn.configure(state="normal")
         self.batch_dl_btn.configure(state="normal")
 
@@ -912,6 +919,8 @@ class HookToShortApp(ctk.CTk):
         self._refresh_track_dropdown()
 
     def _on_batch_retry(self):
+        if self._batch_running:
+            return
         failed_items = [item for item in self._channel_items if item["status"] == "failed"]
         if not failed_items:
             return
@@ -1610,8 +1619,28 @@ class HookToShortApp(ctk.CTk):
         self.schedule_info_label = ctk.CTkLabel(priv_frame, text="", font=self._font(11), text_color="#3498db")
         self.schedule_info_label.pack(side="left", padx=(8, 0))
 
+        # Custom datetime picker (packed then hidden — preserves position in layout)
+        self.custom_schedule_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        self.custom_schedule_frame.pack(fill="x", padx=8, pady=(0, 2))
+        self.custom_schedule_frame.pack_forget()
+        ctk.CTkLabel(self.custom_schedule_frame, text="", width=120).pack(side="left")  # spacer
+        ctk.CTkLabel(self.custom_schedule_frame, text="วันที่:", font=self._font(12)).pack(side="left")
+        self.custom_date_var = ctk.StringVar(value="")
+        ctk.CTkEntry(self.custom_schedule_frame, textvariable=self.custom_date_var,
+                     width=110, font=self._font(12),
+                     placeholder_text="DD/MM/YYYY").pack(side="left", padx=(4, 8))
+        ctk.CTkLabel(self.custom_schedule_frame, text="เวลา:", font=self._font(12)).pack(side="left")
+        self.custom_time_var = ctk.StringVar(value="")
+        ctk.CTkEntry(self.custom_schedule_frame, textvariable=self.custom_time_var,
+                     width=70, font=self._font(12),
+                     placeholder_text="HH:MM").pack(side="left", padx=(4, 0))
+        self.custom_schedule_error = ctk.CTkLabel(
+            self.custom_schedule_frame, text="", font=self._font(11), text_color="#e74c3c")
+        self.custom_schedule_error.pack(side="left", padx=(8, 0))
+
         # Platform toggles
-        plat_frame = ctk.CTkFrame(tab)
+        self._plat_frame = ctk.CTkFrame(tab)
+        plat_frame = self._plat_frame
         plat_frame.pack(fill="x", padx=8, pady=(8, 4))
 
         ctk.CTkLabel(plat_frame, text="แพลตฟอร์ม:", font=self._font(13, "bold")).pack(
@@ -1754,24 +1783,38 @@ class HookToShortApp(ctk.CTk):
         self._on_video_check_changed()
 
     def _on_publish_mode_changed(self, _value=None):
-        """Update schedule info label when publish mode changes."""
+        """Update schedule info label and show/hide custom datetime picker."""
         import random as _rnd
         mode = self.upload_privacy_var.get()
         days = PUBLISH_MODES.get(mode)
-        if days is None:
-            self.schedule_info_label.configure(text="")
-        else:
-            if days == -1:  # random
-                days = _rnd.randint(1, 3)
-            sample = calculate_publish_time("youtube", days)
-            # Show just date + time in a friendly format
-            from datetime import datetime as _dt
-            dt = _dt.fromisoformat(sample)
-            self.schedule_info_label.configure(
-                text=f"ประมาณ {dt.strftime('%d/%m %H:%M')} (เวลาจะสุ่มตาม platform)")
 
-    @staticmethod
-    def _resolve_privacy_and_schedule(mode: str, platform: str, batch_offset: int = 0):
+        if days == -2:  # custom datetime
+            self.schedule_info_label.configure(text="")
+            self.custom_schedule_frame.pack(fill="x", padx=8, pady=(0, 2),
+                                            before=self._plat_frame)
+            self.custom_schedule_error.configure(text="")
+            # Pre-fill with tomorrow's peak time if empty
+            if not self.custom_date_var.get():
+                from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+                ict = _tz(timedelta(hours=7))
+                tomorrow = _dt.now(ict) + _td(days=1)
+                self.custom_date_var.set(tomorrow.strftime("%d/%m/%Y"))
+                self.custom_time_var.set("19:00")
+        else:
+            self.custom_schedule_frame.pack_forget()
+            self.custom_schedule_error.configure(text="")
+            if days is None:
+                self.schedule_info_label.configure(text="")
+            else:
+                if days == -1:  # random
+                    days = _rnd.randint(1, 3)
+                sample = calculate_publish_time("youtube", days)
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(sample)
+                self.schedule_info_label.configure(
+                    text=f"ประมาณ {dt.strftime('%d/%m %H:%M')} (เวลาจะสุ่มตาม platform)")
+
+    def _resolve_privacy_and_schedule(self, mode: str, platform: str, batch_offset: int = 0):
         """Resolve publish mode → (privacy, publish_at) per platform.
 
         Args:
@@ -1789,12 +1832,51 @@ class HookToShortApp(ctk.CTk):
             privacy_map = {"โพสทันที": "public", "ส่วนตัว": "private", "ไม่แสดง": "unlisted"}
             return privacy_map.get(mode, "public"), None
 
+        # Custom datetime from user input
+        if days == -2:
+            return self._parse_custom_schedule(batch_offset)
+
         # Scheduled mode
         if days == -1:  # random 1-3
             days = _rnd.randint(1, 3)
         days += batch_offset
         publish_at = calculate_publish_time(platform, days)
         return "public", publish_at
+
+    def _parse_custom_schedule(self, batch_offset: int = 0):
+        """Parse custom date/time entries → (privacy, publish_at_iso).
+
+        Returns:
+            ("public", iso_string) on success
+        Raises:
+            ValueError if date/time is invalid or in the past
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        ict = _tz(timedelta(hours=7))
+
+        date_str = self.custom_date_var.get().strip()
+        time_str = self.custom_time_var.get().strip()
+
+        if not date_str or not time_str:
+            raise ValueError("กรุณากรอกวันที่และเวลา")
+
+        try:
+            dt = _dt.strptime(f"{date_str} {time_str}", "%d/%m/%Y %H:%M")
+        except ValueError:
+            raise ValueError("รูปแบบไม่ถูกต้อง (DD/MM/YYYY HH:MM)")
+
+        # Attach ICT timezone
+        dt = dt.replace(tzinfo=ict)
+
+        # Add batch offset (extra days for multi-video uploads)
+        if batch_offset > 0:
+            dt += _td(days=batch_offset)
+
+        # Must be in the future
+        if dt <= _dt.now(ict):
+            raise ValueError("เวลาต้องเป็นอนาคต")
+
+        return "public", dt.isoformat()
 
     def _on_video_check_changed(self):
         selected = [(var, fname) for var, fname in self._upload_video_checks if var.get()]
@@ -2000,6 +2082,16 @@ class HookToShortApp(ctk.CTk):
         tags_raw = self.upload_tags_var.get().strip()
         tags = [t.strip().replace("#", "") for t in tags_raw.split(",") if t.strip()]
         publish_mode = self.upload_privacy_var.get()
+
+        # Validate custom schedule before starting upload
+        if PUBLISH_MODES.get(publish_mode) == -2:
+            try:
+                self._parse_custom_schedule()
+                self.custom_schedule_error.configure(text="")
+            except ValueError as e:
+                self.custom_schedule_error.configure(text=str(e))
+                self.upload_progress.configure(text=f"ตั้งเวลาไม่ถูกต้อง: {e}")
+                return
 
         self.upload_btn.configure(state="disabled")
         self.upload_result_frame.pack_forget()
